@@ -1,0 +1,9 @@
+# Willow's own runtime workspace (never commit)
+.willow/
+# safety: never commit personal/dissertation material
+*.pdf
+*email*
+*Dissertation*
+*progress*
+.claude/
+testfolder/

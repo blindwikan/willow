@@ -1,0 +1,27 @@
+EXAMPLE — what Willow said during a real Claude Code session
+============================================================
+
+This is a lightly-cleaned sample from an actual test: Claude Code was asked to
+build a small web page in a folder, while Willow watched it. Each line is what
+Willow spoke aloud (and showed as text).
+
+  Willow: watching testfolder. I'll tell you what the agent changes.
+          Press Enter any time to hear the current state.
+  Willow: created index.html.
+  Willow: created style.css.
+  Willow: created signup-flow.html.
+  Willow: created dashboard.html.
+  Willow: edited index.html (+14 lines).
+
+  [developer pressed Enter to ask "what's the state right now?"]
+  Willow: state right now: 5 new file(s) since we started.
+
+With the CLAUDE.md rule in place, a build/test the agent runs would also be
+announced, e.g.:
+
+  Willow: edited login.js (+8 -2 lines). then 'npm test' passed.
+  Willow: the agent seems stuck on login.js (3 failing attempts in a row).
+  Willow: quietly undid the change to app.js.
+
+See README.md to run it yourself, and RULES.md for exactly how Willow decides
+what to say.
