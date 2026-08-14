@@ -71,11 +71,38 @@ pause with no changes says nothing).
 - **Pull:** press **Enter** any time to hear the current state
   (`state right now: … since we started`). This makes a missed push recoverable.
 
+## Optional natural narration (a wording layer, not a decision layer)
+
+Run `watch --narrate` and Willow will say the **same announcement in more
+natural language**. This is a **wording layer only**, and it changes nothing in
+the rulebook above:
+
+- The rules on this page still decide **what** is announced. An LLM is given the
+  finished factual line (e.g. `edited app.py (+4 -1 lines). then 'pytest'
+  passed.`) and asked only to **re-word** it. It never sees the code or the
+  agent's own account, so it cannot add, drop, or invent a fact — in particular
+  it can never introduce a pass/fail the rulebook did not already establish.
+- The **exact factual line is always written to the log** as ground truth; the
+  natural version is logged beside it on a `(spoken)` line. So every spoken
+  narration is traceable back to a verifiable fact.
+- If narration is unavailable (no key, offline, an error, a slow reply), Willow
+  **silently falls back to the plain factual wording** — it never blocks and
+  never guesses.
+- It uses only the Python standard library (an HTTPS call), so there is still
+  nothing to install. It does need an API key and internet **only in this mode**;
+  the default `watch` is unchanged and needs neither.
+
+This keeps a single voice over verified facts — not one AI interpreting another
+AI — and gives a clean comparison of **deterministic wording** (default) vs
+**LLM wording of the identical facts** (`--narrate`), holding the facts fixed.
+
 ## What is deliberately NOT in the rulebook
 
-- **No AI interpretation.** Willow never says *why* the agent did something or
-  *what it is trying to achieve*. Those are guesses. (A model-based "semantic"
-  grouping is kept as a **future study condition**, not the mechanism.)
+- **No AI interpretation of intent.** Willow never says *why* the agent did
+  something or *what it is trying to achieve*. Those are guesses. The optional
+  narrator above only re-words established facts — it does not interpret. (A
+  model-based "semantic" *grouping* is kept as a **future study condition**, not
+  the mechanism.)
 - **No visual/layout description** in this version (the on-demand "guess"
   channel is future work).
 

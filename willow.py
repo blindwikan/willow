@@ -10,6 +10,8 @@ passed or failed), never guesses.
 Two commands:
 
     python willow.py watch [folder]     Start watching (run in its own window).
+    python willow.py watch --narrate    Same, but say the SAME verified facts in
+                                        a more natural voice (needs an API key).
     python willow.py run  <command>     Run a build/test command THROUGH Willow
                                         so it can report the real pass/fail.
 
@@ -38,6 +40,7 @@ import threading
 import queue
 import subprocess
 import platform
+import urllib.request
 
 # --------------------------------------------------------------------------
 # Settings (plain, reviewable numbers)
@@ -61,6 +64,16 @@ WILLOW_DIR = ".willow"
 INBOX_NAME = "inbox.jsonl"     # willow run writes verified results here (JSON)
 RESULTS_NAME = "results.txt"   # a simple "tray": drop plain pass/fail lines here
 LOG_NAME = "willow.log"        # a plain text copy of everything Willow says
+
+# --- Optional LLM narration (see the Narrator class) ----------------------
+# Off unless you run 'watch --narrate'. It ONLY rewords Willow's own verified
+# facts into a more natural spoken sentence - it never sees your code or the
+# agent's account, and Willow always falls back to plain wording if it fails.
+NARRATE_MODEL = "claude-haiku-4-5"   # small, fast, cheap - this is only phrasing
+NARRATE_MAX_TOKENS = 200
+NARRATE_TIMEOUT = 8                  # seconds; falls back to plain wording if slow
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
 
 
 # --------------------------------------------------------------------------
@@ -119,6 +132,97 @@ class Speaker:
         else:  # Linux and others
             subprocess.run(["espeak", one_line],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# --------------------------------------------------------------------------
+# Optional: giving Willow a more natural voice (the narrator)
+# --------------------------------------------------------------------------
+
+class Narrator:
+    """Turns Willow's VERIFIED facts into a natural spoken sentence.
+
+    This is a WORDING layer only, and it is off unless you ask for it. It is
+    handed the exact factual line Willow already built from watching the folder
+    (files changed, +/- lines, pass/fail, silent undos) and asked to say the
+    same thing more naturally. It never sees your code or the agent's own
+    account, so it cannot invent a result - it can only re-word facts Willow
+    already checked. If it is unavailable for any reason (no key, offline, an
+    error, a slow reply), Willow silently falls back to the plain factual
+    sentence: it never blocks and never guesses.
+
+    Uses only the Python standard library (urllib), so Willow keeps its
+    "nothing to install" promise even with narration switched on.
+    """
+
+    SYSTEM = (
+        "You are the voice of Willow, a tool that tells a blind developer what "
+        "an AI coding agent just did to their project. You will be given a line "
+        "of VERIFIED FACTS that Willow checked for itself. Rephrase it into one "
+        "or two short, natural spoken sentences for a screen-reader user. "
+        "Rules: say ONLY what the facts state. Do not add, guess, soften, or "
+        "invent anything - in particular, never say a build or test passed or "
+        "failed unless the facts say so. Keep file names and numbers exact. No "
+        "preamble and no sign-off - just the spoken sentence."
+    )
+
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.api_key = self._find_key()
+        self._warned = False
+        if self.enabled and not self.api_key:
+            print("Willow: (note) narration is on, but I couldn't find an API "
+                  "key. Set ANTHROPIC_API_KEY, or put your key in a file called "
+                  ".willow_key in your home folder. Until then I'll use plain "
+                  "wording.")
+            self.enabled = False
+
+    def _find_key(self):
+        key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        if key:
+            return key
+        try:
+            path = os.path.join(os.path.expanduser("~"), ".willow_key")
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read().strip() or None
+        except OSError:
+            return None
+
+    def narrate(self, facts):
+        """Return a natural rewording of `facts`, or None to fall back to plain."""
+        if not self.enabled or not self.api_key:
+            return None
+        body = json.dumps({
+            "model": NARRATE_MODEL,
+            "max_tokens": NARRATE_MAX_TOKENS,
+            "system": self.SYSTEM,
+            "messages": [{"role": "user", "content": facts}],
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            ANTHROPIC_URL, data=body, method="POST",
+            headers={
+                "x-api-key": self.api_key,
+                "anthropic-version": ANTHROPIC_VERSION,
+                "content-type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=NARRATE_TIMEOUT) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            # offline, bad key, timeout, anything at all -> silent fallback
+            if not self._warned:
+                self._warned = True
+                print("Willow: (note) natural narration is unavailable right "
+                      "now (offline, or the service didn't answer); using plain "
+                      "wording. I won't mention this again.")
+            return None
+        # If the model declined or returned nothing usable, fall back to plain.
+        if data.get("stop_reason") == "refusal":
+            return None
+        pieces = [b.get("text", "") for b in data.get("content", [])
+                  if b.get("type") == "text"]
+        text = " ".join(p.strip() for p in pieces if p.strip())
+        return text or None
 
 
 # --------------------------------------------------------------------------
@@ -237,9 +341,10 @@ def describe_change(rel, base_info, now_info):
 # --------------------------------------------------------------------------
 
 class Willow:
-    def __init__(self, folder, speaker):
+    def __init__(self, folder, speaker, narrator=None):
         self.folder = os.path.abspath(folder)
         self.speaker = speaker
+        self.narrator = narrator  # optional: rewords facts more naturally
         self.log_path = os.path.join(self.folder, WILLOW_DIR, LOG_NAME)
         self.inbox_path = os.path.join(self.folder, WILLOW_DIR, INBOX_NAME)
         self.results_path = os.path.join(self.folder, WILLOW_DIR, RESULTS_NAME)
@@ -260,15 +365,26 @@ class Willow:
 
     # ---- output -----------------------------------------------------------
 
-    def announce(self, text):
-        line = f"Willow: {text}"
-        print(line, flush=True)
+    def announce(self, text, narratable=False):
+        # `text` is ALWAYS the verified factual line. If narration is on and
+        # this is a change report, we speak a natural rewording of the same
+        # facts; otherwise we speak the facts as-is. Either way the exact
+        # factual line is written to the log as the citable ground truth.
+        spoken = text
+        if narratable and self.narrator is not None:
+            alt = self.narrator.narrate(text)
+            if alt:
+                spoken = alt
+        print("Willow: " + spoken, flush=True)
         try:
             with open(self.log_path, "a", encoding="utf-8") as f:
                 f.write(time.strftime("%H:%M:%S ") + text + "\n")
+                if spoken != text:
+                    f.write(time.strftime("%H:%M:%S ") + "(spoken) "
+                            + spoken + "\n")
         except OSError:
             pass
-        self.speaker.say("Willow. " + text)
+        self.speaker.say("Willow. " + spoken)
 
     # ---- main loop --------------------------------------------------------
 
@@ -439,7 +555,7 @@ class Willow:
         # commit new baseline and speak, if there is anything worth saying
         self.committed = dict(now)
         if parts:
-            self.announce(". ".join(parts) + ".")
+            self.announce(". ".join(parts) + ".", narratable=True)
         for note in stuck_notes:
             self.announce(note + ".")
 
@@ -468,7 +584,7 @@ class Willow:
             if stuck:
                 msg += ". Possibly stuck on: " + ", ".join(stuck)
             msg += "."
-        self.announce(msg)
+        self.announce(msg, narratable=True)
 
 
 # --------------------------------------------------------------------------
@@ -489,7 +605,16 @@ def find_willow_dir(start):
 
 
 def cmd_watch(argv):
-    folder = argv[0] if argv else "."
+    # pull the optional --narrate flag out of the arguments
+    narrate = False
+    positional = []
+    for a in argv:
+        if a in ("--narrate", "-n"):
+            narrate = True
+        else:
+            positional.append(a)
+
+    folder = positional[0] if positional else "."
     folder = os.path.abspath(folder)
     if not os.path.isdir(folder):
         print(f"Willow: that folder does not exist: {folder}")
@@ -497,7 +622,11 @@ def cmd_watch(argv):
     os.makedirs(os.path.join(folder, WILLOW_DIR), exist_ok=True)
 
     speaker = Speaker(enabled=True)
-    willow = Willow(folder, speaker)
+    narrator = Narrator(enabled=True) if narrate else None
+    if narrator is not None and narrator.enabled:
+        print("Willow: natural narration is on - I'll say the same verified "
+              "facts in a more natural way (the exact facts are still saved).")
+    willow = Willow(folder, speaker, narrator=narrator)
 
     worker = threading.Thread(target=willow.run, daemon=True)
     worker.start()
@@ -567,6 +696,11 @@ HELP = """Willow - a companion narrator for blind builders using Claude Code.
 Usage:
   python willow.py watch [folder]     Start watching a project folder.
                                       (Leave [folder] out to watch this folder.)
+  python willow.py watch --narrate    Watch, but say the SAME verified facts in
+                                      a more natural voice. Needs an API key in
+                                      ANTHROPIC_API_KEY (or a .willow_key file in
+                                      your home folder). Falls back to plain
+                                      wording if it's ever unavailable.
   python willow.py run  <command>     Run a build/test command through Willow
                                       so it can report the real pass/fail,
                                       e.g. python willow.py run npm test

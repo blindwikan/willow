@@ -97,6 +97,27 @@ announce it.
 - It works on **Windows and Mac** using the computer's built-in voice, no
   internet needed.
 
+## Optional: a more natural voice
+
+By default, Willow words its announcements with a fixed rulebook (no internet, no
+account needed). If you'd like it to say the **same facts** in a more natural,
+spoken way, add `--narrate`:
+
+```bash
+python willow.py watch --narrate
+```
+
+- This mode asks a small language model to **re-word Willow's own verified
+  facts** — it never sees your code and can't invent anything. The exact facts
+  are still saved to the log.
+- It needs an **Anthropic API key** and internet **only in this mode**. Put your
+  key in the `ANTHROPIC_API_KEY` environment variable, or in a file called
+  `.willow_key` in your home folder. (It is never stored in this project.)
+- If the key is missing or the service is unavailable, Willow just uses the plain
+  wording — it never stops working.
+
+The normal `watch` (above) needs none of this. `--narrate` is entirely optional.
+
 ## What this first version does *not* do (on purpose)
 
 - It does **not** describe how the screen *looks* (the visual layer). That's
