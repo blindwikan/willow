@@ -118,9 +118,31 @@ python willow.py watch --narrate
 
 The normal `watch` (above) needs none of this. `--narrate` is entirely optional.
 
+## Optional: hear what your app *looks* like
+
+While Willow is watching, type **`describe`** and press Enter, and Willow will
+tell you how the app you're building **looks** right now:
+
+```
+describe
+```
+
+- Willow **finds your app's browser window by itself** — you don't have to aim
+  it or leave the terminal.
+- It **names the window it grabbed first** (a fact — e.g. *"Chrome — 'Welcome —
+  Sign in'"*), then describes how it looks, clearly labelled as an
+  **interpretation, not a checked fact**. So if it ever grabbed the wrong window,
+  you'd hear the wrong name and know to ignore the rest.
+- If it can't find your app, or the window is minimised, or there's no key, it
+  **says so plainly** — it never invents a description.
+
+Have your app **open in a browser** (Chrome, Edge, Firefox…) before you type
+`describe`. Like `--narrate`, this uses your **Anthropic API key** (a picture has
+to be looked at). **Windows only for now** — other systems are planned.
+
 ## What this first version does *not* do (on purpose)
 
-- It does **not** describe how the screen *looks* (the visual layer). That's
-  planned for a later version.
+- It does **not** *automatically* interrupt you with a visual description — you
+  ask for it with `describe`. A proactive "nudge" is planned for a later version.
 - It does **not** use any AI to decide what to tell you — a fixed rulebook does
   that, so it behaves the same every time. See [RULES.md](RULES.md).

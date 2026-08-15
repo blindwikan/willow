@@ -15,8 +15,9 @@ Two commands:
     python willow.py run  <command>     Run a build/test command THROUGH Willow
                                         so it can report the real pass/fail.
 
-While 'watch' is running, press ENTER at any time to hear the current state
-("what's the state right now?"), or type q then ENTER to quit.
+While 'watch' is running: press ENTER at any time to hear the current state
+("what's the state right now?"); type 'describe' to hear what your app looks
+like (needs an API key, Windows for now); or type q then ENTER to quit.
 
 Design principles:
   * FACTS vs GUESSES: Willow reports only verifiable facts. No AI interpretation.
@@ -40,6 +41,7 @@ import threading
 import queue
 import subprocess
 import platform
+import base64
 import urllib.request
 
 # --------------------------------------------------------------------------
@@ -74,6 +76,35 @@ NARRATE_MAX_TOKENS = 200
 NARRATE_TIMEOUT = 8                  # seconds; falls back to plain wording if slow
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
+
+# --- Optional visual description (see the Viewer class) --------------------
+# Off unless you type 'describe' while watching. It captures YOUR APP's browser
+# window and describes how it LOOKS. A screen description is an interpretation
+# (a guess), so Willow always announces the window it grabbed (a fact) first,
+# then the description (clearly labelled a guess). Windows only for now.
+VIEW_MODEL = "claude-haiku-4-5"      # vision-capable, cheap
+VIEW_MAX_TOKENS = 500
+VIEW_TIMEOUT = 30                    # seconds; a picture takes a little longer
+VIEW_MAX_WIDTH = 1400                # shrink big screenshots to keep cost/time down
+# Browser processes Willow will look for (the window showing your app):
+VIEW_BROWSERS = ("chrome", "msedge", "firefox", "brave", "opera",
+                 "vivaldi", "arc", "chromium")
+
+
+def find_api_key():
+    """Find the Anthropic API key from the environment or ~/.willow_key.
+
+    Never read from inside the project folder, so it can't end up in the repo.
+    """
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        path = os.path.join(os.path.expanduser("~"), ".willow_key")
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -177,15 +208,7 @@ class Narrator:
             self.enabled = False
 
     def _find_key(self):
-        key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-        if key:
-            return key
-        try:
-            path = os.path.join(os.path.expanduser("~"), ".willow_key")
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read().strip() or None
-        except OSError:
-            return None
+        return find_api_key()
 
     def narrate(self, facts):
         """Return a natural rewording of `facts`, or None to fall back to plain."""
@@ -217,6 +240,229 @@ class Narrator:
                       "wording. I won't mention this again.")
             return None
         # If the model declined or returned nothing usable, fall back to plain.
+        if data.get("stop_reason") == "refusal":
+            return None
+        pieces = [b.get("text", "") for b in data.get("content", [])
+                  if b.get("type") == "text"]
+        text = " ".join(p.strip() for p in pieces if p.strip())
+        return text or None
+
+
+# --------------------------------------------------------------------------
+# Optional: describing what the app LOOKS like (the "guess" channel)
+# --------------------------------------------------------------------------
+
+class Viewer:
+    """Describes how YOUR APP looks, on demand ('describe' while watching).
+
+    A screen description is unavoidably an interpretation, so this is Willow's
+    first clearly-labelled GUESS channel - kept apart from the facts. To make it
+    painless and hard to get wrong:
+
+      * Willow finds your app's BROWSER WINDOW itself - you never aim it.
+      * It announces the window it grabbed (its real title - a FACT) BEFORE the
+        description, so a wrong grab is obvious the moment you hear it.
+      * The description is spoken clearly as an interpretation, never a fact.
+      * If it can't find the window, or it's minimised, or there's no key, it
+        SAYS so plainly - it never invents a description.
+
+    Windows only for now (uses built-in PowerShell + .NET, so still no installs).
+    The picture is sent to a vision model the same way narration sends text.
+    """
+
+    SYSTEM = (
+        "You are describing a screenshot of an app to a blind developer who is "
+        "building it and cannot see the screen. Describe what is visibly on "
+        "screen in plain, spoken language: the overall layout, the main "
+        "headings and text, buttons, links, form fields and their labels, "
+        "colours, and how things are arranged. Be concrete and specific about "
+        "what you can see. This is a description of APPEARANCE only - an "
+        "interpretation, not a verified fact. Do not claim anything works, "
+        "passed, or failed, and do not guess about code or behaviour. Keep it "
+        "to one clear paragraph. No preamble."
+    )
+
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.api_key = find_api_key()  # resolved quietly; reported only on use
+
+    def describe(self, hint, out_path):
+        """Return a list of announcement lines (fact first, then the guess)."""
+        if platform.system() != "Windows":
+            return ["Describing your app isn't set up for this operating "
+                    "system yet - right now it works on Windows."]
+        if not self.api_key:
+            return ["To describe your app I need an API key - the same one "
+                    "narration uses. Set ANTHROPIC_API_KEY, or put your key in "
+                    "a file called .willow_key in your home folder, then try "
+                    "'describe' again."]
+
+        status, name, title = self._capture_windows(hint, out_path)
+        if status == "NOWINDOW":
+            return ["I couldn't find a browser window showing your app. Make "
+                    "sure your app is open in a browser, then type 'describe' "
+                    "again."]
+        if status == "MINIMIZED":
+            return [f"Your app window '{title}' seems to be minimised, so I "
+                    "can't see it right now. Bring it up and try 'describe' "
+                    "again."]
+        if status != "OK":
+            return ["I couldn't capture your app window just now. Please try "
+                    "'describe' again in a moment."]
+
+        pretty = {"chrome": "Chrome", "msedge": "Edge", "firefox": "Firefox",
+                  "brave": "Brave", "opera": "Opera", "vivaldi": "Vivaldi",
+                  "arc": "Arc", "chromium": "Chromium"}.get(
+                      (name or "").lower(), name or "a browser")
+        port = self._detect_dev_port()
+        where = f", at localhost:{port}" if port else ""
+        fact = f"Describing your app window: {pretty} - '{title}'{where}."
+
+        desc = self._vision_describe(out_path)
+        if not desc:
+            return [fact, "I found your app window but couldn't get a "
+                          "description just now (offline, or the service didn't "
+                          "answer). Please try 'describe' again."]
+        guess = ("Here's what it looks like - this is my interpretation, not a "
+                 "checked fact. " + desc)
+        return [fact, guess]
+
+    # ---- finding + photographing the app's browser window (Windows) --------
+
+    def _capture_windows(self, hint, out_path):
+        hint = (hint or "").replace("'", "''")
+        out = out_path.replace("'", "''")
+        browsers = ",".join("'%s'" % b for b in VIEW_BROWSERS)
+        script = r'''
+Add-Type -AssemblyName System.Drawing
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class WCap {
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint nFlags);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+}
+"@
+$browsers = @(%BROWSERS%)
+$wins = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -ne '' -and ($browsers -contains $_.ProcessName.ToLower()) }
+if (-not $wins) { Write-Output 'NOWINDOW'; exit }
+$hint = '%HINT%'
+$target = $null
+if ($hint -ne '') { $target = $wins | Where-Object { $_.MainWindowTitle -like "*$hint*" } | Select-Object -First 1 }
+if (-not $target) { $target = $wins | Select-Object -First 1 }
+$h = $target.MainWindowHandle
+$title = $target.MainWindowTitle
+$name = $target.ProcessName
+if ([WCap]::IsIconic($h)) { Write-Output ("MINIMIZED`t" + $title); exit }
+$r = New-Object WCap+RECT
+[WCap]::GetWindowRect($h, [ref]$r) | Out-Null
+$w = $r.Right - $r.Left
+$hh = $r.Bottom - $r.Top
+if ($w -le 0 -or $hh -le 0) { Write-Output 'ERROR'; exit }
+$bmp = New-Object System.Drawing.Bitmap $w, $hh
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$hdc = $g.GetHdc()
+[WCap]::PrintWindow($h, $hdc, 2) | Out-Null
+$g.ReleaseHdc($hdc)
+$g.Dispose()
+$final = $bmp
+$maxw = %MAXW%
+if ($w -gt $maxw) {
+  $nh = [int]($hh * $maxw / $w)
+  $scaled = New-Object System.Drawing.Bitmap $maxw, $nh
+  $sg = [System.Drawing.Graphics]::FromImage($scaled)
+  $sg.DrawImage($bmp, 0, 0, $maxw, $nh)
+  $sg.Dispose()
+  $final = $scaled
+}
+$final.Save('%OUT%', [System.Drawing.Imaging.ImageFormat]::Png)
+$final.Dispose()
+$bmp.Dispose()
+Write-Output ("OK`t" + $name + "`t" + $title)
+'''
+        script = (script.replace("%BROWSERS%", browsers)
+                        .replace("%HINT%", hint)
+                        .replace("%MAXW%", str(VIEW_MAX_WIDTH))
+                        .replace("%OUT%", out))
+        try:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                capture_output=True, text=True, timeout=VIEW_TIMEOUT)
+            out_lines = [ln.strip() for ln in proc.stdout.splitlines()
+                         if ln.strip()]
+        except Exception:
+            return ("ERROR", None, None)
+        if not out_lines:
+            return ("ERROR", None, None)
+        fields = out_lines[-1].split("\t")
+        status = fields[0]
+        if status == "OK" and len(fields) >= 3:
+            return ("OK", fields[1], fields[2])
+        if status == "MINIMIZED" and len(fields) >= 2:
+            return ("MINIMIZED", None, fields[1])
+        return (status, None, None)
+
+    def _detect_dev_port(self):
+        """Best-effort: a single obvious local dev server port, else None."""
+        common = {3000, 3001, 4000, 4200, 5000, 5173, 5174,
+                  8000, 8080, 8081, 9000, 1234, 3333}
+        try:
+            proc = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+                                  capture_output=True, text=True, timeout=5)
+        except Exception:
+            return None
+        found = set()
+        for line in proc.stdout.splitlines():
+            if "LISTENING" not in line:
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            local = parts[1]
+            if ":" not in local:
+                continue
+            try:
+                port = int(local.rsplit(":", 1)[1])
+            except ValueError:
+                continue
+            if port in common:
+                found.add(port)
+        return next(iter(found)) if len(found) == 1 else None
+
+    # ---- asking the vision model to describe the picture -------------------
+
+    def _vision_describe(self, img_path):
+        try:
+            with open(img_path, "rb") as f:
+                raw = f.read()
+        except OSError:
+            return None
+        b64 = base64.standard_b64encode(raw).decode("ascii")
+        body = json.dumps({
+            "model": VIEW_MODEL,
+            "max_tokens": VIEW_MAX_TOKENS,
+            "system": self.SYSTEM,
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64",
+                 "media_type": "image/png", "data": b64}},
+                {"type": "text", "text": "Describe what is on this screen."},
+            ]}],
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            ANTHROPIC_URL, data=body, method="POST",
+            headers={
+                "x-api-key": self.api_key,
+                "anthropic-version": ANTHROPIC_VERSION,
+                "content-type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=VIEW_TIMEOUT) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return None
         if data.get("stop_reason") == "refusal":
             return None
         pieces = [b.get("text", "") for b in data.get("content", [])
@@ -341,10 +587,11 @@ def describe_change(rel, base_info, now_info):
 # --------------------------------------------------------------------------
 
 class Willow:
-    def __init__(self, folder, speaker, narrator=None):
+    def __init__(self, folder, speaker, narrator=None, viewer=None):
         self.folder = os.path.abspath(folder)
         self.speaker = speaker
         self.narrator = narrator  # optional: rewords facts more naturally
+        self.viewer = viewer      # optional: describes how the app looks
         self.log_path = os.path.join(self.folder, WILLOW_DIR, LOG_NAME)
         self.inbox_path = os.path.join(self.folder, WILLOW_DIR, INBOX_NAME)
         self.results_path = os.path.join(self.folder, WILLOW_DIR, RESULTS_NAME)
@@ -389,10 +636,12 @@ class Willow:
     # ---- main loop --------------------------------------------------------
 
     def run(self):
+        extra = (" Type describe to hear what your app looks like."
+                 if self.viewer is not None else "")
         self.announce(
             f"watching {os.path.basename(self.folder)}. "
             "I'll tell you what the agent changes. "
-            "Press Enter any time to hear the current state.")
+            "Press Enter any time to hear the current state." + extra)
         while not self.stop.is_set():
             time.sleep(POLL_SECONDS)
             try:
@@ -586,6 +835,17 @@ class Willow:
             msg += "."
         self.announce(msg, narratable=True)
 
+    # ---- the "what does it look like?" answer (visual pull) ----------------
+
+    def describe_view(self):
+        if self.viewer is None:
+            self.announce("describing the app isn't switched on right now.")
+            return
+        hint = os.path.basename(self.folder)
+        out_path = os.path.join(self.folder, WILLOW_DIR, "last_view.png")
+        for line in self.viewer.describe(hint, out_path):
+            self.announce(line)
+
 
 # --------------------------------------------------------------------------
 # Commands
@@ -626,7 +886,8 @@ def cmd_watch(argv):
     if narrator is not None and narrator.enabled:
         print("Willow: natural narration is on - I'll say the same verified "
               "facts in a more natural way (the exact facts are still saved).")
-    willow = Willow(folder, speaker, narrator=narrator)
+    viewer = Viewer(enabled=True)  # 'describe' is always offered while watching
+    willow = Willow(folder, speaker, narrator=narrator, viewer=viewer)
 
     worker = threading.Thread(target=willow.run, daemon=True)
     worker.start()
@@ -637,10 +898,13 @@ def cmd_watch(argv):
             cmd = line.strip().lower()
             if cmd in ("q", "quit", "exit"):
                 break
-            if cmd in ("", "state", "status", "s"):
+            if cmd in ("describe", "desc", "see", "look", "d"):
+                willow.describe_view()
+            elif cmd in ("", "state", "status", "s"):
                 willow.state_summary()
             elif cmd in ("help", "h", "?"):
-                print("Willow: press Enter for current state, or type q to quit.")
+                print("Willow: press Enter for current state, type describe to "
+                      "hear what your app looks like, or q to quit.")
             else:
                 willow.state_summary()
     except KeyboardInterrupt:
@@ -705,7 +969,8 @@ Usage:
                                       so it can report the real pass/fail,
                                       e.g. python willow.py run npm test
 
-While watching: press Enter to hear the current state; type q to quit.
+While watching: press Enter to hear the current state; type 'describe' to hear
+what your app looks like (needs an API key, Windows for now); type q to quit.
 """
 
 

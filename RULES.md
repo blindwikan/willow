@@ -96,6 +96,26 @@ This keeps a single voice over verified facts — not one AI interpreting anothe
 AI — and gives a clean comparison of **deterministic wording** (default) vs
 **LLM wording of the identical facts** (`--narrate`), holding the facts fixed.
 
+## Optional visual description (`describe`) — the on-demand "guess" channel
+
+Type `describe` while watching and Willow describes how the app **looks**. A
+screen description is unavoidably an interpretation, so this is kept firmly
+**separate from the facts** and handled so it can't mislead:
+
+- Willow **finds the app's browser window itself** (it looks for a browser
+  process showing your app), so the user never has to aim it or leave the
+  terminal.
+- It announces the **window it captured first** — the window's real title is a
+  **fact** — and only then speaks the description, **explicitly labelled an
+  interpretation**. Because the user can't see the screen to check, that spoken
+  window-name is the safety net: a wrong grab is heard immediately.
+- The picture is captured with the OS's own tools and sent to a vision model the
+  same way narration sends text. If the window can't be found, is minimised, or
+  there's no key, Willow **says so** — it never invents a description.
+
+This is the **guess** side of the facts-vs-guesses split made explicit: the
+window identity is a checkable fact; the look is an owned-up-to guess.
+
 ## What is deliberately NOT in the rulebook
 
 - **No AI interpretation of intent.** Willow never says *why* the agent did
@@ -103,8 +123,10 @@ AI — and gives a clean comparison of **deterministic wording** (default) vs
   narrator above only re-words established facts — it does not interpret. (A
   model-based "semantic" *grouping* is kept as a **future study condition**, not
   the mechanism.)
-- **No visual/layout description** in this version (the on-demand "guess"
-  channel is future work).
+- **No *automatic* visual description.** The visual `describe` above is
+  **on-demand only** — Willow never interrupts you with it unprompted. A
+  proactive "nudge", non-browser apps, and systems other than Windows are all
+  future work.
 
 ## Adjustable numbers (in `willow.py`)
 
