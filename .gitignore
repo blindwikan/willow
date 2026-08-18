@@ -7,3 +7,9 @@
 *progress*
 .claude/
 testfolder/
+
+# Python build artefacts
+__pycache__/
+*.egg-info/
+build/
+dist/
