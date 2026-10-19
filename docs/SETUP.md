@@ -91,6 +91,67 @@ speech; `loud` restores it. `faster` and `slower` change the system voice rate.
 These interactive choices last for the running watcher; edit `.willow/config.json`
 to keep preferences across runs. `--no-voice` stays text-only throughout.
 
+## Focus and keyboard review
+
+Start with `willow watch --focus --no-voice` for a quiet terminal after the
+startup instructions. `focus on` enables the same mode in a running watcher.
+Automatic file changes, command results and warnings are buffered as text and
+speech; recording continues. Explicit commands still answer immediately.
+Focus controls Willow's watcher output, not output in the agent/command window.
+
+Type `review` to hear/read the first buffered update. Use `next`, `previous`,
+`repeat` and `expand` to navigate, with a spoken item number and list length.
+`expand` reads the current update's details. The list is a snapshot: new
+updates do not move your place. Run `review` again to include them. There is
+no wrap at either end. `focus status` reports the current mode and buffer size.
+`focus off` resumes new automatic output without dumping older updates.
+
+`review clear` clears the buffer, leaving retained facts and logs. The buffer
+is held only in memory and defaults to 200 updates (`focus_buffer_limit`);
+overflow is reported at review. Closing the watcher discards this buffer.
+Use `browse` for the latest 100 retained file facts, newest first, and
+`history PATH` for up to 20 facts for one file. Both open the same navigator;
+`expand` shows the current fact's evidence. `briefing` also supplies a list
+for navigation. Logs rotate, and memory retention limits still apply.
+Save `"focus": true` in config to start in focus mode each time.
+
+## Build results and their observed version
+
+Run tests/builds through `willow run COMMAND` in your other window. Type
+`checks` in the watcher for the latest result, or `checks all` for up to 20
+retained results. State requests and startup also report the latest result.
+The command's actual exit code is separate from version freshness:
+
+- Matching observed files and Git context at both command endpoints and now
+  give an endpoint match, with an explicit reminder that coverage is unknown.
+- Later edits or a different Git revision make the result differ from now.
+- Changes during the command make its tested version uncertain.
+- Older results and hooks without endpoint observations say the version was
+  not recorded; unreadable paths or another project scope are unverifiable.
+
+Observations use Willow's normal ignored directories, file limits and symlink
+policy. They do not include ignored/generated/external dependencies or prove
+what a test exercised. Temporary edits restored between observations can be
+missed. Commands that intentionally generate watched files may therefore have
+an uncertain version even when they succeeded. No coverage claim is inferred.
+
+## Personal handover notes
+
+Before leaving, type `note working Fixing keyboard navigation`,
+`note blockers Waiting for the test fixture`, and `note next Check tab order`.
+Use `note` to read them, `note clear working` to clear one field, or
+`note clear` to remove all three. Each field allows 4000 characters.
+These are explicitly labelled **User note (not verified)** and shown again at
+startup, or buffered in focus mode. They never become verified change facts,
+model narration input, announcement-log text or study-export text.
+
+Without a watcher, use `willow handover --folder PATH --working "Fixing
+navigation" --blockers "Waiting for a fixture" --next "Check tab order"`.
+`willow handover --folder PATH` reads notes; `--clear` removes them. Plain-text
+notes are kept in `.willow/handover.json`; choose what you save there.
+
+Study recording is a separate opt-in feature described in [STUDY.md](STUDY.md).
+
 ## Checking speech and limitations
 
 Run `doctor` without `--no-voice` to request an audible check. Confirm you hear

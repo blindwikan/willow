@@ -1,14 +1,23 @@
 # Validation of the follow-up build
 
-Checked on 19 October 2026. Local execution was on Windows; this is not a
+Checked on 20 October 2026. Local execution was on Windows; this is not a
 claim of native screen-reader validation on any platform.
 
 | Interpreter used locally | Regression suite |
 |---|---|
-| Python 3.12.10 | 223 tests passed |
-| Python 3.13.12 | 223 tests passed |
-| Python 3.14.6 | 223 tests passed |
-| Python 3.15.0 | 223 tests passed |
+| Python 3.12.10 | 269 tests passed |
+| Python 3.13.12 | 269 tests passed |
+| Python 3.14.6 | 269 tests passed |
+| Python 3.15.0 | 269 tests passed |
+
+The 46 new support regressions cover buffered focus output, keyboard browsing,
+observed test-version freshness (including real wrapped command execution),
+private handover notes, and default-off study metrics with redacted exports.
+This includes two real processes with the watcher's keyboard pipe held open;
+background Git context queries detach stdin so they cannot stall on that pipe.
+The installed wheel also passed a separate real-process smoke session covering
+focus/review, retained facts and evidence, a stale result, saved notes and a
+redacted study export on Python 3.15.
 
 The Python 3.15 environment used pip 26.2.1, setuptools 84.2.0, wheel 0.48.0,
 and build 1.6.1, resolved from PyPI during the check. OpenAI SDK 3.35.1 was
@@ -28,7 +37,8 @@ build succeeds today.
 The Python 3.15 synthetic evaluation passed 16 of 16 explicit fixtures, with
 20 correct facts, no false positives/negatives and no repeated facts in those
 fixtures. Across 110 small-project revisits it retained the configured 30
-sessions; the database occupied 81,920 bytes. These are synthetic regression
+sessions; the database occupied 86,016 bytes after adding the retained-result
+table. These are synthetic regression
 results, not participant outcomes or realistic large-project performance claims.
 The generated report records the host, source hash and measured timings.
 

@@ -307,3 +307,78 @@ edits retain unknown authorship. `Stop` says `Codex has finished its turn`;
 `PermissionRequest` says `Codex is requesting your permission`. Neither implies
 a test verdict. Only an explicit integer exit code or `willow run` establishes
 pass/fail. These cases are pinned in `test_openai.py`.
+
+## Focus, review and handover
+
+`focus on` or `watch --focus` buffers **all automatic watcher text and speech**,
+including failures and warnings. Explicit requests still answer immediately.
+The acknowledgement is `Focus mode on. Automatic text and speech are buffered.
+Type review when ready.` Startup instructions explain focus mode; automatic
+startup briefings, notes and results go into the buffer. `pause` controls only
+speech and is a separate choice. The worker keeps observing/checkpointing.
+
+`focus off` says `Focus mode off. New automatic updates can appear; buffered
+updates remain available with review.` It never dumps a backlog. The default
+buffer holds 200 updates, is limited by `focus_buffer_limit`, and is discarded
+on exit. Overflow is reported at review. Logs rotate and memory has its own
+retention limits; focus does not change them. `review clear` says `Buffered
+review cleared. Recorded facts and logs are retained.`
+
+`review`, `browse`, `history PATH` and `briefing` populate a keyboard navigator.
+`review` freezes a snapshot of buffered updates, `browse` loads up to 100 newest
+facts, and file history loads up to 20. The browser says `TITLE, item N of M:
+TEXT`. `next` and `previous` move once; `repeat` repeats the current item;
+`expand` reads its details or evidence. Boundaries say `Already at the first
+item.` / `Already at the last item.` and do not wrap. An empty list replaces
+any earlier list. `next` no longer selects another visual window; use `other`.
+
+Notes have only working, blockers and next fields, at most 4000 characters
+each. They live in `.willow/handover.json` and are displayed as `User note
+(not verified). LABEL: TEXT`. They stay separate from verified change facts,
+model narration, announcement logs and study-export text. Control characters
+are escaped. Corrupt notes are preserved when a save fails. Clearing notes
+does not clear memory. Startup returns saved notes, buffered when in focus.
+The standalone `handover` command works without a watcher.
+
+## Observed build/test version
+
+`willow run` observes watched-file hashes and Git context at both command
+endpoints. The exit code is still the command's real outcome, independent of
+freshness. Retain up to 20 result records in memory; `checks` requests the
+latest and `checks all` requests all retained results. Startup and state also
+report the latest result. Failure snippets are not copied into the result
+table; local command arguments can still contain sensitive text.
+
+| Observation | Freshness wording |
+|---|---|
+| Same scope, known endpoints and current matching signature | `matches observed project state at both command endpoints; test coverage not established` |
+| Current signature differs from the recorded endpoint | `observed project state differs from this check` |
+| Before/after signatures differ | `observed files changed during the command; tested version uncertain` |
+| Missing endpoint observations | `tested version not recorded` |
+| Unreadable observations, invalid signatures or another project scope | `tested version could not be verified` |
+
+These are bounded observations using the regular file/ignore/symlink policy.
+They cannot establish tested coverage, observe ignored/external dependencies,
+or detect edits that were made and reverted between snapshots. A successful
+command never implies the current project has been fully tested.
+
+## Opt-in study ledger
+
+Recording is off by default; ordinary use and `study status` create no study
+database. `study start CODE` explicitly starts a local recording with a
+participant code. Recording persists across watcher restarts until `study
+stop`; startup announces active recording. A second start cannot silently
+replace an active session. This is a recording control, not consent or ethics
+approval. Metrics failures do not stop project observation.
+
+`.willow/study.sqlite3` accepts only allowed event shapes: canonical actions,
+restricted phase labels, counts, relative timings and user-reported collisions.
+`study mark` accepts setup, practice, task, task-CODE, break, return, interview
+or complete. `study collision` records a user report, not detected overlap.
+Speech metrics count requests, not audible delivery. No accuracy, usability
+or speech-idle verdict is inferred. Export revalidates the allowed shapes and
+does not contain source, paths, hashes, command arguments, note text,
+announcement text or absolute timestamps. The participant code and generated
+session ID remain. Repeat/stop request counts and phase durations are derived
+only from recorded actions. Recording stops independently of speech `stop`.
+Nothing is uploaded. `test_support.py` pins these support behaviors.

@@ -62,6 +62,8 @@ import uuid
 import ast
 import contextlib
 import argparse
+import tempfile
+import math
 import urllib.request
 import urllib.error
 
@@ -101,6 +103,8 @@ DEFAULTS = {
     "provenance_labels": True,
     "memory_enabled": True,
     "startup_briefing": True,
+    "focus": False,             # buffer automatic text AND speech until asked
+    "focus_buffer_limit": 200,
 
     # --- optional model use (narration + describe) ---
     "provider": "auto",         # auto | anthropic | openai | ollama |
@@ -192,7 +196,7 @@ def load_config(folder, overrides=None):
             ("voice_rate", -10, 10, int), ("poll_seconds", 0.05, 60, float),
             ("quiet_seconds", 0, 300, float), ("repeat_seconds", 0, 3600, float),
             ("briefing_limit", 1, 100, int), ("memory_sessions", 1, 1000, int),
-            ("memory_facts", 1, 1000000, int)):
+            ("memory_facts", 1, 1000000, int), ("focus_buffer_limit", 1, 10000, int)):
         try:
             value = kind(cfg[key])
             if not low <= value <= high:
@@ -1906,7 +1910,8 @@ def git_context(folder):
                       ("branch", ["symbolic-ref", "--short", "-q", "HEAD"])):
         try:
             p = subprocess.run(["git", "-C", folder] + args, capture_output=True,
-                               text=True, encoding="utf-8", errors="replace", timeout=3)
+                               stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
+                               errors="replace", timeout=3)
             if p.returncode == 0:
                 result[key] = p.stdout.strip()
         except (OSError, subprocess.SubprocessError):
@@ -2012,6 +2017,238 @@ def change_sentence(change):
     return f"{phrase}; {actor}"
 
 
+def write_json_atomic(path, data):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".tmp",
+                                         dir=os.path.dirname(os.path.abspath(path)), delete=False) as f:
+            temporary = f.name
+            json.dump(data, f, ensure_ascii=True, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.remove(temporary)
+
+
+def observed_check_state(folder, ignore_dirs=None):
+    """Endpoint observation, not a claim of which files a test actually covers."""
+    eyes = Eyes(folder, git_ignored_dirs(folder) | set(ignore_dirs or ()))
+    eyes.prime()
+    return check_state_from_eyes(eyes, git_context(folder))
+
+
+def check_state_from_eyes(eyes, context):
+    payload = {"files": sorted((p.replace("\\", "/"), h)
+                               for p, h in eyes.snapshot_hashes().items()),
+               "git": context}
+    return {"folder": os.path.normcase(os.path.realpath(eyes.folder)),
+            "signature": hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest(),
+            "uncertain": bool(eyes.unreadable or getattr(eyes, "scan_errors", ())),
+            "file_count": len(payload["files"])}
+
+
+def check_freshness(check, current):
+    verification = check.get("verification")
+    if not isinstance(verification, dict):
+        return "tested version not recorded"
+    before, after = verification.get("before"), verification.get("after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return "tested version not recorded"
+    for state in (before, after, current):
+        if (state.get("uncertain") or not isinstance(state.get("signature"), str)
+                or not re.fullmatch(r"[a-f0-9]{64}", state["signature"])
+                or not isinstance(state.get("folder"), str) or not state["folder"]
+                or state.get("folder") != current.get("folder")):
+            return "tested version could not be verified"
+    if before["signature"] != after["signature"]:
+        return "observed files changed during the command; tested version uncertain"
+    if after["signature"] != current["signature"]:
+        return "observed project state differs from this check"
+    return "matches observed project state at both command endpoints; test coverage not established"
+
+
+class HandoverNotes:
+    FIELDS = {"working": "What I was doing", "blockers": "Blockers", "next": "Next step"}
+
+    def __init__(self, folder):
+        self.path = os.path.join(folder, WILLOW_DIR, "handover.json")
+
+    def read(self):
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return {}
+        if (not isinstance(data, dict) or any(k not in self.FIELDS for k in data)
+                or any(not isinstance(v, str) for v in data.values())):
+            raise ValueError("invalid handover notes; the existing file was preserved")
+        return data
+
+    def save(self, field, text):
+        if field not in self.FIELDS or not isinstance(text, str) or len(text) > 4000:
+            raise ValueError("choose working, blockers or next, with at most 4000 characters")
+        notes = self.read()
+        if text.strip():
+            notes[field] = text.strip()
+        else:
+            notes.pop(field, None)
+        write_json_atomic(self.path, notes)
+
+    def clear(self, field=None):
+        if field:
+            self.save(field, "")
+        else:
+            # Only this known file is removed; never other Willow memory.
+            try:
+                os.remove(self.path)
+            except FileNotFoundError:
+                pass
+
+
+class StudyRecorder:
+    """Explicit opt-in. The separate study ledger accepts only safe metrics.
+
+    No announcement text, file paths/hashes, commands, note text, wall-clock
+    timestamps, screenshots or source code are included in its exports.
+    """
+    SCHEMA = {
+        "phase": {"label": str}, "collision_reported": {},
+        "command": {"name": str}, "speech_requested": {"automatic": bool, "word_count": int},
+        "speech_filtered": {}, "focus_buffered": {"detail_count": int},
+        "navigation": {"action": str, "position": int, "total": int},
+        "episode": {"file_count": int, "check_count": int, "failure_count": int},
+        "briefing": {"shown": int, "total": int},
+    }
+    COMMANDS = {"state", "diff", "recap", "briefing", "history", "evidence", "away", "back",
+                "focus", "review", "browse", "next", "previous", "repeat", "expand", "checks",
+                "note", "stop", "pause", "resume", "describe", "other", "help", "quit",
+                "faster", "slower", "quiet", "loud"}
+    PHASE = re.compile(r"(?:setup|practice|break|return|interview|complete|task(?:-[A-Za-z0-9]{1,16})?)\Z")
+
+    def __init__(self, folder):
+        self.path = os.path.join(folder, WILLOW_DIR, "study.sqlite3")
+
+    @contextlib.contextmanager
+    def db(self):
+        db = sqlite3.connect(self.path, timeout=3)
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
+
+    def start(self, participant):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", participant):
+            raise ValueError("use a participant code such as P01, without names or contact details")
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with self.db() as db:
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS study_sessions (
+                    id TEXT PRIMARY KEY, participant TEXT, started REAL, ended REAL);
+                CREATE UNIQUE INDEX IF NOT EXISTS study_one_active
+                    ON study_sessions ((1)) WHERE ended IS NULL;
+                CREATE TABLE IF NOT EXISTS study_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT,
+                    elapsed REAL, kind TEXT, data TEXT);
+            """)
+            if db.execute("SELECT 1 FROM study_sessions WHERE ended IS NULL").fetchone():
+                raise ValueError("study recording is already active; stop it before starting another")
+            session = uuid.uuid4().hex
+            db.execute("INSERT INTO study_sessions VALUES (?, ?, ?, NULL)",
+                       (session, participant, time.time()))
+        return session
+
+    def active(self):
+        if not os.path.exists(self.path):
+            return None
+        with self.db() as db:
+            row = db.execute("SELECT id, participant, started FROM study_sessions WHERE ended IS NULL").fetchone()
+        return {"id": row[0], "participant": row[1], "started": row[2]} if row else None
+
+    def record(self, kind, **data):
+        if not self.valid_event(kind, data) or not os.path.exists(self.path):
+            return False
+        with self.db() as db:
+            row = db.execute("SELECT id, started FROM study_sessions WHERE ended IS NULL").fetchone()
+            if not row:
+                return False
+            db.execute("INSERT INTO study_events (session, elapsed, kind, data) VALUES (?, ?, ?, ?)",
+                       (row[0], max(0, time.time() - row[1]), kind, json.dumps(data)))
+        return True
+
+    @classmethod
+    def valid_event(cls, kind, data):
+        schema = cls.SCHEMA.get(kind)
+        if (schema is None or not isinstance(data, dict) or set(data) != set(schema)
+                or any(type(data[k]) is not t for k, t in schema.items())):
+            return False
+        if kind == "command" and data["name"] not in cls.COMMANDS:
+            return False
+        if kind == "phase" and not cls.PHASE.fullmatch(data["label"]):
+            return False
+        if kind == "navigation" and data["action"] not in ("load", "next", "previous", "repeat", "expand"):
+            return False
+        if any(type(v) is int and (v < 0 or v > 10000000) for v in data.values()):
+            return False
+        return True
+
+    def stop(self):
+        if not os.path.exists(self.path):
+            return False
+        with self.db() as db:
+            cur = db.execute("UPDATE study_sessions SET ended=? WHERE ended IS NULL", (time.time(),))
+            return cur.rowcount > 0
+
+    def export(self, session=None):
+        if not os.path.exists(self.path):
+            raise ValueError("no study recording exists")
+        with self.db() as db:
+            if session:
+                row = db.execute("SELECT id, participant, started, ended FROM study_sessions WHERE id=?", (session,)).fetchone()
+            else:
+                row = db.execute("SELECT id, participant, started, ended FROM study_sessions ORDER BY started DESC LIMIT 1").fetchone()
+            if not row:
+                raise ValueError("that study session does not exist")
+            rows = db.execute("SELECT elapsed, kind, data FROM study_events WHERE session=? ORDER BY id", (row[0],)).fetchall()
+        if (not isinstance(row[0], str) or not re.fullmatch(r"[a-f0-9]{32}", row[0])
+                or not isinstance(row[1], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", row[1])
+                or any(type(v) not in (int, float) or not math.isfinite(v)
+                       for v in (row[2], row[3] if row[3] is not None else time.time()))):
+            raise ValueError("invalid study session metadata; export was not written")
+        duration = max(0, (row[3] if row[3] is not None else time.time()) - row[2])
+        events, counts, phases = [], {}, {}
+        last_phase, last_at = None, 0
+        for elapsed, kind, raw in rows:
+            try:
+                data = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            # Revalidate on export too: never trust arbitrary rows in a local DB.
+            if (not self.valid_event(kind, data) or type(elapsed) not in (int, float)
+                    or not math.isfinite(elapsed) or not 0 <= elapsed <= duration):
+                continue
+            events.append({"elapsed_seconds": round(elapsed, 3), "kind": kind, "data": data})
+            counts[kind] = counts.get(kind, 0) + 1
+            if kind == "phase":
+                if last_phase:
+                    phases[last_phase] = phases.get(last_phase, 0) + max(0, elapsed - last_at)
+                last_phase, last_at = data["label"], elapsed
+        if last_phase:
+            phases[last_phase] = phases.get(last_phase, 0) + max(0, duration - last_at)
+        commands = [e["data"]["name"] for e in events if e["kind"] == "command"]
+        return {"schema_version": 1, "study_session": row[0], "participant_code": row[1],
+                "recording_active": row[3] is None, "duration_seconds": round(duration, 3),
+                "metrics": {"event_counts": counts, "repeat_requests": commands.count("repeat"),
+                            "stop_requests": commands.count("stop"),
+                            "reported_collisions": counts.get("collision_reported", 0),
+                            "phase_seconds": {k: round(v, 3) for k, v in phases.items()}},
+                "events": events,
+                "measurement_limits": "Speech requests and user-reported collisions; audible delivery and task accuracy are not inferred."}
+
+
 class ProjectMemory:
     """SQLite transactions keep checkpoint + facts together, including on crash.
 
@@ -2038,6 +2275,8 @@ class ProjectMemory:
                     at REAL, path TEXT, old_path TEXT, data TEXT);
                 CREATE INDEX IF NOT EXISTS facts_path ON facts(path, id);
                 CREATE INDEX IF NOT EXISTS facts_old_path ON facts(old_path, id);
+                CREATE TABLE IF NOT EXISTS checks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL, data TEXT);
                 PRAGMA user_version=1;
             """)
 
@@ -2117,6 +2356,29 @@ class ProjectMemory:
             row = db.execute("SELECT id, at, data FROM facts WHERE id=?", (fact_id,)).fetchone()
         return dict(json.loads(row[2]), id=row[0], at=row[1]) if row else None
 
+    def recent(self, limit=100):
+        with self.db() as db:
+            rows = db.execute("SELECT id, at, data FROM facts ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(json.loads(row[2]), id=row[0], at=row[1]) for row in rows]
+
+    def save_check(self, check):
+        # Keep command metadata, not captured failure/source snippets. Local
+        # command arguments may themselves be sensitive; never study-export them.
+        retained = {k: check[k] for k in ("command", "exit_code", "seconds", "verification", "ts") if k in check}
+        with self.db() as db:
+            db.execute("INSERT INTO checks (at, data) VALUES (?, ?)",
+                       (time.time(), json.dumps(retained)))
+            db.execute("DELETE FROM checks WHERE id NOT IN (SELECT id FROM checks ORDER BY id DESC LIMIT 20)")
+
+    def recent_checks(self):
+        with self.db() as db:
+            rows = db.execute("SELECT data FROM checks ORDER BY id DESC LIMIT 20").fetchall()
+        checks = [json.loads(row[0]) for row in rows]
+        if any(not isinstance(c, dict) or type(c.get("exit_code")) is not int
+               or not isinstance(c.get("command", ""), str) for c in checks):
+            raise ValueError("invalid retained command result")
+        return checks
+
 
 # ==========================================================================
 # The watcher (Willow's brain) - groups changes into chunks and announces
@@ -2167,6 +2429,17 @@ class Willow:
         self._state_lock = threading.RLock()
         self._away = None
         self._output_context = threading.local()
+        self.focus = bool(cfg.get("focus"))
+        self._pending_output = []
+        self._pending_dropped = 0
+        self._output_lock = threading.RLock()
+        self._review = []
+        self._review_index = -1
+        self._review_title = "changes"
+        self.notes = HandoverNotes(self.folder)
+        self.study = StudyRecorder(self.folder)
+        self._study_failed = False
+        self._checks = []
         self._recent_speech = {}
         self._episode_provenance = []
         self.memory = None
@@ -2186,6 +2459,7 @@ class Willow:
                 self.return_changes = compare_snapshots(previous, self._memory_snapshot,
                                                         self._offline_provenance())
             self.memory.begin(self._memory_snapshot, self._git_context, self.return_changes)
+            self._checks = self.memory.recent_checks()
         except (OSError, sqlite3.Error, ValueError, TypeError, KeyError) as e:
             self.memory_error = str(e)
             self.memory = None
@@ -2256,11 +2530,200 @@ class Willow:
         return display_path(phrase) + " [" + actor + "]"
 
     def _automatic(self, method, *args, **kwargs):
+        previous = getattr(self._output_context, "automatic", False)
         self._output_context.automatic = True
         try:
-            method(*args, **kwargs)
+            return method(*args, **kwargs)
         finally:
-            self._output_context.automatic = False
+            self._output_context.automatic = previous
+
+    def _study_record(self, kind, **data):
+        if self._study_failed:
+            return
+        try:
+            self.study.record(kind, **data)
+        except (OSError, sqlite3.Error, ValueError, TypeError):
+            self._study_failed = True
+            self._automatic(self.announce, "Study metrics could not be saved. Project watching continues; check study status.", urgent=True)
+
+    def set_focus(self, enabled):
+        with self._output_lock:
+            self.focus = enabled
+        self.speaker.stop_talking()
+        self.announce("Focus mode on. Automatic text and speech are buffered. Type review when ready."
+                      if enabled else
+                      "Focus mode off. New automatic updates can appear; buffered updates remain available with review.", urgent=True)
+
+    def _buffer_output(self, text, details, private=False):
+        with self._output_lock:
+            if not (self.focus and getattr(self._output_context, "automatic", False)):
+                return False
+            self._pending_output.append({"text": text, "details": list(details), "private": private})
+            limit = max(1, int(self.cfg["focus_buffer_limit"]))
+            if len(self._pending_output) > limit:
+                self._pending_output.pop(0)
+                self._pending_dropped += 1
+        self._study_record("focus_buffered", detail_count=len(details))
+        return True
+
+    def _load_review(self, items, title):
+        self._review = list(items)
+        self._review_index = 0 if items else -1
+        self._review_title = title
+        if not items:
+            self.announce("No " + title + " to review.", urgent=True)
+            return
+        self.navigate("load")
+
+    def review_pending(self, clear=False):
+        with self._output_lock:
+            if clear:
+                self._pending_output = []
+                self._pending_dropped = 0
+                if self._review_title == "buffered updates":
+                    self._review, self._review_index = [], -1
+                self.announce("Buffered review cleared. Recorded facts and logs are retained.", urgent=True)
+                return
+            items = list(self._pending_output)
+            dropped = self._pending_dropped
+        if dropped:
+            self.announce(f"{dropped} older updates are outside the buffer. Use browse for retained file facts; logs retain recorded announcements.", urgent=True)
+        self._load_review(items, "buffered updates")
+
+    def browse_changes(self):
+        if not self.memory:
+            self.announce("Project history is unavailable.", urgent=True)
+            return
+        self._load_review(self.memory.recent(), "retained changes")
+
+    def navigate(self, action):
+        if not self._review:
+            self.announce("No active change list. Type review, browse, history PATH or briefing first.", urgent=True)
+            return
+        index = self._review_index
+        if action == "next":
+            if index >= len(self._review) - 1:
+                self.announce("Already at the last item.", urgent=True)
+                return
+            index += 1
+        elif action == "previous":
+            if index <= 0:
+                self.announce("Already at the first item.", urgent=True)
+                return
+            index -= 1
+        self._review_index = index
+        item = self._review[index]
+        if "text" in item:
+            text = item["text"]
+        else:
+            stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(item["at"])) + ": " if "at" in item else ""
+            text = stamp + change_sentence(item) + f". Evidence {item['id']}."
+        self.announce(f"{self._review_title}, item {index + 1} of {len(self._review)}: " + text,
+                      urgent=True, log=not item.get("private", False))
+        if action == "expand":
+            if "details" in item:
+                for detail in item["details"]:
+                    self.announce(detail, urgent=True, log=not item.get("private", False))
+            else:
+                self.show_evidence(item["id"])
+        self._study_record("navigation", action=action, position=index + 1, total=len(self._review))
+
+    def handover(self, field=None, text=None, clear=False):
+        try:
+            if clear:
+                self.notes.clear(field)
+                self.announce("User handover notes cleared.", urgent=True)
+            elif field:
+                self.notes.save(field, text or "")
+                self.announce("User handover note saved. It is separate from verified project changes.", urgent=True)
+            else:
+                notes = self.notes.read()
+                if not notes:
+                    self.announce("No user handover notes saved. Use note working TEXT, note blockers TEXT, or note next TEXT.", urgent=True)
+                for key, label in HandoverNotes.FIELDS.items():
+                    if key in notes:
+                        self.announce("User note (not verified). " + label + ": " + display_path(notes[key]),
+                                      urgent=True, log=False)
+        except (OSError, ValueError) as error:
+            self.announce("Could not read or save handover notes: " + str(error), urgent=True)
+
+    def check_summary(self, full=False):
+        if not self._checks:
+            self.announce("No retained build or test results. Use willow run to record a command and its observed project state.", urgent=True)
+            return
+        current = observed_check_state(self.folder, self.cfg.get("extra_ignore_dirs"))
+        for check in self._checks[:20 if full else 1]:
+            code = normalize_exit_code(check["exit_code"])
+            verdict = "passed" if code == 0 else f"failed with exit code {code}"
+            self.announce("Recorded command '" + display_path(check.get("command", "the check"))
+                          + "' " + verdict + "; " + check_freshness(check, current) + ".", urgent=True)
+
+    def record_request(self, raw):
+        """Record only a canonical action, never arguments or unknown input."""
+        cmd = raw.lower()
+        aliases = {
+            "state": ("", "state", "status", "s"), "quit": ("q", "quit", "exit"),
+            "stop": ("stop", "shh", "shut up", "quiet!", "x"),
+            "describe": ("describe", "desc", "see", "look", "d"),
+            "other": ("other", "another", "wrong window"),
+            "diff": ("diff", "changes", "what changed"),
+            "recap": ("recap", "summary", "session"),
+            "briefing": ("briefing", "since", "briefing all"),
+            "pause": ("pause", "on-demand"), "resume": ("resume", "automatic"),
+            "faster": ("faster", "f", "+"), "slower": ("slower", "-"),
+            "quiet": ("quiet", "less"), "loud": ("loud", "more", "normal"),
+            "help": ("help", "h", "?"), "previous": ("previous", "prev"),
+        }
+        for name, values in aliases.items():
+            if cmd in values:
+                self._study_record("command", name=name)
+                return
+        for name in ("history", "evidence", "focus", "review", "checks", "note"):
+            if cmd == name or cmd.startswith(name + " "):
+                self._study_record("command", name=name)
+                return
+        if cmd in StudyRecorder.COMMANDS:
+            self._study_record("command", name=cmd)
+
+    def support_command(self, raw):
+        """Keyboard-only controls; preserve case/spaces in note and export text."""
+        cmd = raw.lower()
+        if cmd in ("focus", "focus on", "focus off", "focus status"):
+            if cmd == "focus status":
+                self.announce(f"Focus mode {'on' if self.focus else 'off'}; {len(self._pending_output)} buffered updates.", urgent=True)
+            else:
+                self.set_focus(cmd != "focus off")
+        elif cmd in ("review", "review clear"):
+            self.review_pending(clear=cmd.endswith("clear"))
+        elif cmd == "browse":
+            self.browse_changes()
+        elif cmd in ("next", "previous", "prev", "repeat", "expand"):
+            self.navigate("previous" if cmd == "prev" else cmd)
+        elif cmd in ("checks", "checks all"):
+            self.check_summary(full=cmd.endswith("all"))
+        elif cmd == "note" or cmd.startswith("note "):
+            parts = raw.split(None, 2)
+            if len(parts) == 1:
+                self.handover()
+            elif parts[1].lower() == "clear":
+                self.handover(field=parts[2].lower() if len(parts) > 2 else None, clear=True)
+            elif len(parts) == 3:
+                self.handover(parts[1].lower(), parts[2])
+            else:
+                self.announce("Use note working TEXT, note blockers TEXT, note next TEXT, or note clear.", urgent=True)
+        elif cmd == "study" or cmd.startswith("study "):
+            parts = raw.split(None, 2)
+            action = parts[1].lower() if len(parts) > 1 else "status"
+            value = parts[2].strip('"') if len(parts) > 2 else None
+            try:
+                message = study_action(self.study, action, value)
+                self._study_failed = False
+                self.announce(message, urgent=True)
+            except (OSError, sqlite3.Error, ValueError, TypeError) as error:
+                self.announce("Study recording: " + str(error), urgent=True)
+        else:
+            return False
+        return True
 
     def _speak_output(self, text, urgent=False, narratable=False):
         automatic = getattr(self._output_context, "automatic", False)
@@ -2278,8 +2741,11 @@ class Willow:
             self._recent_speech[text] = now
         self.speaker.say(text, priority=(P_URGENT if urgent else P_NORMAL),
                          narratable=narratable)
+        if self.cfg.get("voice", True):
+            self._study_record("speech_requested", automatic=automatic, word_count=len(text.split()))
 
     def briefing(self, full=False):
+        self._review, self._review_index, self._review_title = [], -1, "return changes"
         if self.memory_error:
             self.announce("I couldn't read or save project memory; I cannot verify "
                           "a since-you-were-last-here briefing. " + self.memory_error, urgent=True)
@@ -2289,6 +2755,8 @@ class Willow:
                           "for your next visit.", urgent=True)
             return
         details = self.return_changes
+        if details:
+            self._review, self._review_index, self._review_title = list(details), 0, "return changes"
         stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(self.previous_session["at"]))
         extra = " The previous session ended without a final checkpoint." if not self.previous_session["closed"] else ""
         if self._memory_snapshot.get("uncertain"):
@@ -2313,13 +2781,7 @@ class Willow:
         if not self.memory:
             self.announce("Project history is unavailable. Run willow doctor for details.", urgent=True)
             return
-        rows = self.memory.history(path)
-        if not rows:
-            self.announce("No retained history for " + display_path(path) + ".", urgent=True)
-        for change in rows:
-            stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(change["at"]))
-            self.announce(stamp + ": " + change_sentence(change)
-                          + f". Evidence {change['id']}.", urgent=True)
+        self._load_review(self.memory.history(path), "history for " + display_path(path))
 
     def show_evidence(self, fact_id):
         change = self.memory.evidence(fact_id) if self.memory else None
@@ -2377,30 +2839,37 @@ class Willow:
 
     # ---- output ----------------------------------------------------------
 
-    def announce(self, text, urgent=False, narratable=False):
+    def announce(self, text, urgent=False, narratable=False, log=True):
         """`text` is ALWAYS the exact verified factual line.
 
-        It is printed and logged immediately. Speaking (and, with narration on,
-        rewording) happens on the speaker thread, so a slow model can never
-        stall the watching or shift a chunk boundary.
+        It is logged immediately unless private. Focus buffers automatic
+        terminal and speech output. Speech runs on its own thread, so a slow
+        model cannot stall watching or shift a chunk boundary.
         """
-        print("Willow: " + text, flush=True)
-        self._write_log(text)
-        self._speak_output(text, urgent, narratable)
+        if log:
+            self._write_log(text)
+        with self._output_lock:
+            if self._buffer_output(text, [text], private=not log):
+                return
+            print("Willow: " + text, flush=True)
+            self._speak_output(text, urgent, narratable)
 
     def announce_lines(self, header, details, urgent=False, narratable=False):
         """Speak the collapsed form, but print one detail per line so a screen
         reader can arrow through them."""
-        print("Willow: " + header, flush=True)
-        if len(details) > 1:
-            for d in details:
-                print("        - " + d, flush=True)
         self._write_log(header)
-        limit = max(1, int(self.cfg["briefing_limit"]))
-        spoken = header
-        if len(details) > limit:
-            spoken = ". ".join(details[:limit]) + f". {len(details) - limit} more details are in the text and diff."
-        self._speak_output(spoken, urgent, narratable)
+        with self._output_lock:
+            if self._buffer_output(header, details):
+                return
+            print("Willow: " + header, flush=True)
+            if len(details) > 1:
+                for d in details:
+                    print("        - " + d, flush=True)
+            limit = max(1, int(self.cfg["briefing_limit"]))
+            spoken = header
+            if len(details) > limit:
+                spoken = ". ".join(details[:limit]) + f". {len(details) - limit} more details are in the text and diff."
+            self._speak_output(spoken, urgent, narratable)
 
     def on_spoken(self, facts, spoken):
         if spoken != facts:
@@ -2427,31 +2896,53 @@ class Willow:
                 f.write(json.dumps(rec, default=str) + "\n")
         except OSError:
             pass
+        if kind == "episode":
+            checks = fields.get("checks", [])
+            self._study_record("episode", file_count=len(fields.get("files", [])),
+                               check_count=len(checks), failure_count=sum(c.get("exit_code") != 0 for c in checks))
+        elif kind == "briefing":
+            self._study_record("briefing", shown=len(fields.get("fact_ids", [])), total=fields.get("total", 0))
+        elif kind == "speech_filtered":
+            self._study_record("speech_filtered")
 
     # ---- main loop -------------------------------------------------------
 
     def run(self):
         self._heartbeat()
         extra = " Type help to hear what you can ask me."
+        if self.focus:
+            extra += " Focus mode is on; type review for buffered updates."
         self.announce(f"watching {os.path.basename(self.folder)}. "
                       "I'll record what changes. "
                       "Press Enter any time to hear the current state." + extra,
                       urgent=True)
+        try:
+            if self.study.active():
+                self.announce("Opt-in study recording is active. Type study stop to stop collecting metrics.", urgent=True)
+        except (OSError, sqlite3.Error):
+            self.announce("Study recording status is unavailable. Type study status for details.", urgent=True)
         if self.cfg.get("startup_briefing", True):
-            self.briefing()
+            if self.focus:
+                self._automatic(self.briefing)
+            else:
+                self.briefing()
+        if os.path.exists(self.notes.path):
+            self._automatic(self.handover) if self.focus else self.handover()
+        if self._checks:
+            self._automatic(self.check_summary) if self.focus else self.check_summary()
         last_beat = time.time()
         errors = 0
         while not self.stop.is_set():
             if self.stop.wait(self.cfg["poll_seconds"]):
                 break
             try:
-                self._tick()
+                self._automatic(self._tick)
                 errors = 0
             except Exception as e:
                 errors += 1
                 if errors == 1:
-                    self.announce(f"I hit a problem while watching: {e}. "
-                                  "I'm still going.", urgent=True)
+                    self._automatic(self.announce, f"I hit a problem while watching: {e}. "
+                                    "I'm still going.", urgent=True)
                     self.event("watcher_error", error=str(e))
             if time.time() - last_beat >= HEARTBEAT_SECONDS:
                 self._heartbeat()
@@ -2724,7 +3215,17 @@ class Willow:
         # (e) build/test outcomes: a hard fact from a real exit code
         any_failure = False
         failure_phrases = []
+        current_check_state = (check_state_from_eyes(self.eyes, git_context(self.folder))
+                               if checks and self.cfg.get("provenance_labels", True) else None)
         for check in checks:
+            if type(check.get("exit_code")) is int:
+                self._checks.insert(0, dict(check))
+                self._checks = self._checks[:20]
+                if self.memory:
+                    try:
+                        self.memory.save_check(check)
+                    except (OSError, sqlite3.Error, ValueError):
+                        self.event("check_storage_error")
             code = normalize_exit_code(check.get("exit_code"))
             cmd = check.get("command", "the check")
             took = check.get("seconds")
@@ -2739,6 +3240,10 @@ class Willow:
                 if detail:
                     phrase += f". {detail}"
                 failure_phrases.append(phrase)
+            if current_check_state:
+                phrase += "; " + check_freshness(check, current_check_state)
+                if code != 0:
+                    failure_phrases[-1] = phrase
             parts.append(phrase)
             details.append(phrase)
 
@@ -2845,6 +3350,8 @@ class Willow:
                 msg += ". Possibly stuck on: " + ", ".join(stuck)
             msg += "."
         self.announce(msg, urgent=True, narratable=True)
+        if self._checks and self.cfg.get("provenance_labels", True):
+            self.check_summary()
 
     def recap(self):
         s = self.session
@@ -2999,6 +3506,7 @@ def cmd_watch(argv):
     parser.add_argument("--nvda-dll")
     parser.add_argument("--no-briefing", action="store_true")
     parser.add_argument("--no-memory", action="store_true")
+    parser.add_argument("--focus", action="store_true", help="buffer automatic text and speech until requested")
     parser.add_argument("--no-provenance-labels", action="store_true")
     args = parser.parse_args(argv)
     narrate = args.narrate
@@ -3013,6 +3521,8 @@ def cmd_watch(argv):
         overrides["startup_briefing"] = False
     if args.no_memory:
         overrides["memory_enabled"] = False
+    if args.focus:
+        overrides["focus"] = True
     if args.no_provenance_labels:
         overrides["provenance_labels"] = False
     if args.poll_seconds is not None and args.poll_seconds <= 0:
@@ -3068,6 +3578,13 @@ def cmd_watch(argv):
         "history PATH - retained changes to one file (spaces are allowed)",
         "evidence NUMBER - inspect a recorded fact and its hashes",
         "away / back - save a break baseline / hear changes while away",
+        "focus on / off / status - buffer automatic text and speech",
+        "review / review clear - browse buffered updates / clear their buffer",
+        "browse    - browse retained change facts",
+        "next / previous / repeat / expand - move through the active list",
+        "checks / checks all - retained results and observed version freshness",
+        "note working|blockers|next TEXT / note / note clear - user handover",
+        "study start CODE / mark PHASE / collision / stop / status / export PATH - opt-in metrics",
         "describe  - what does my app look like right now",
         "other     - describe a different window instead",
         "stop      - stop talking (also: shh)",
@@ -3083,14 +3600,17 @@ def cmd_watch(argv):
             cmd = raw.lower()
             # An explicit request has priority over a routine speech backlog.
             speaker.stop_talking()
+            willow.record_request(raw)
             if cmd in ("q", "quit", "exit"):
                 break
+            elif willow.support_command(raw):
+                pass
             elif cmd in ("stop", "shh", "shut up", "quiet!", "x"):
                 speaker.stop_talking()
                 print("Willow: (quiet)", flush=True)
             elif cmd in ("describe", "desc", "see", "look", "d"):
                 threading.Thread(target=willow.describe_view, daemon=True).start()
-            elif cmd in ("other", "another", "wrong window", "next"):
+            elif cmd in ("other", "another", "wrong window"):
                 threading.Thread(target=willow.describe_other_window, daemon=True).start()
             elif cmd in ("diff", "changes", "what changed"):
                 willow.read_diff()
@@ -3140,6 +3660,7 @@ def cmd_watch(argv):
                 for h in HELP_LINES:
                     print("        " + h, flush=True)
                 speaker.say("You can ask for state, diff, recap, briefing, history, evidence, away, back, describe, "
+                            "focus, review, browse, next, previous, repeat, expand, checks, note, study, "
                             "stop, pause, resume, faster, slower, quiet, loud, or q to quit.",
                             priority=P_URGENT)
             elif cmd in ("", "state", "status", "s"):
@@ -3152,7 +3673,7 @@ def cmd_watch(argv):
         willow.stop.set()
         worker.join(timeout=max(5, cfg["poll_seconds"] + 4))
         if not worker.is_alive():
-            willow._tick()
+            willow._automatic(willow._tick)
             if willow.ep_touched or willow.ep_writes:
                 willow._close_episode([])
             willow._save_memory(closed=True)
@@ -3193,6 +3714,16 @@ def cmd_run(argv):
         return 127
 
     print(f"Willow: running '{command_str}' ...", flush=True)
+    target, live = resolve_target_dir()
+    observed_folder = os.path.dirname(os.path.abspath(target))
+    # A global key/config directory is not a project to scan unless watched.
+    if not live and os.path.normcase(observed_folder) == os.path.normcase(os.path.dirname(user_config_dir())):
+        observed_folder = os.getcwd()
+    check_ignores = load_config(observed_folder).get("extra_ignore_dirs", [])
+    try:
+        before_state = observed_check_state(observed_folder, check_ignores)
+    except (OSError, ValueError, TypeError):
+        before_state = None
     start = time.time()
     tail = []
     try:
@@ -3231,6 +3762,11 @@ def cmd_run(argv):
     detail = summarize_output("".join(tail), exit_code) if capture else None
     record = {"ts": time.time(), "type": "check", "command": command_str,
               "exit_code": exit_code, "seconds": took}
+    try:
+        record["verification"] = {"before": before_state,
+                                  "after": observed_check_state(observed_folder, check_ignores)}
+    except (OSError, ValueError, TypeError):
+        pass
     if detail:
         record["detail"] = detail
     deliver(record)
@@ -3432,6 +3968,89 @@ def _codex_hook(event, payload):
                         cwd, warn=False)
     except (OSError, ValueError, TypeError, KeyError):
         return
+
+
+def study_action(recorder, action, value=None, session=None):
+    if action == "start":
+        if not value:
+            raise ValueError("use study start P01 after obtaining participant consent")
+        recorder.start(value)
+        return "Opt-in study metrics recording started. No source, notes, paths or command text are collected. Type study stop to stop."
+    if action == "stop":
+        return "Study metrics recording stopped." if recorder.stop() else "Study recording is already off."
+    if action == "status":
+        active = recorder.active()
+        return "Study recording is active for participant code " + active["participant"] + "." if active else "Study recording is off."
+    if action == "mark":
+        if not value or not recorder.PHASE.fullmatch(value):
+            raise ValueError("choose setup, practice, task, task-CODE, break, return, interview or complete")
+        if not recorder.record("phase", label=value):
+            raise ValueError("start study recording before marking a phase")
+        return "Study phase marked: " + value + "."
+    if action == "collision":
+        if not recorder.record("collision_reported"):
+            raise ValueError("start study recording before reporting a speech collision")
+        return "User-reported speech collision recorded."
+    if action == "export":
+        output = value or os.path.join(os.path.dirname(recorder.path), "study-export.json")
+        write_json_atomic(output, recorder.export(session))
+        return "Redacted study metrics exported to " + display_path(os.path.abspath(output)) + "."
+    raise ValueError("use study start P01, mark PHASE, collision, status, stop or export PATH")
+
+
+def cmd_study(argv):
+    parser = argparse.ArgumentParser(prog="willow study")
+    parser.add_argument("action", choices=("start", "stop", "status", "mark", "collision", "export"))
+    parser.add_argument("value", nargs="?")
+    parser.add_argument("--folder", default=".")
+    parser.add_argument("--output")
+    parser.add_argument("--session")
+    args = parser.parse_args(argv)
+    try:
+        if not os.path.isdir(args.folder):
+            raise ValueError("that project folder does not exist")
+        if args.output and args.action != "export":
+            raise ValueError("--output is only used with export")
+        if args.session and args.action != "export":
+            raise ValueError("--session is only used with export")
+        print("Willow: " + study_action(StudyRecorder(os.path.abspath(args.folder)), args.action,
+                                       args.output or args.value, args.session))
+        return 0
+    except (OSError, sqlite3.Error, ValueError, TypeError) as error:
+        print("Willow: study recording: " + str(error))
+        return 1
+
+
+def cmd_handover(argv):
+    parser = argparse.ArgumentParser(prog="willow handover")
+    parser.add_argument("--folder", default=".")
+    parser.add_argument("--working")
+    parser.add_argument("--blockers")
+    parser.add_argument("--next", dest="next_step")
+    parser.add_argument("--clear", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        if not os.path.isdir(args.folder):
+            raise ValueError("that project folder does not exist")
+        notes = HandoverNotes(os.path.abspath(args.folder))
+        if args.clear:
+            if any(v is not None for v in (args.working, args.blockers, args.next_step)):
+                raise ValueError("use --clear separately from setting notes")
+            notes.clear()
+        else:
+            for field, value in (("working", args.working), ("blockers", args.blockers), ("next", args.next_step)):
+                if value is not None:
+                    notes.save(field, value)
+        data = notes.read()
+        if not data:
+            print("Willow: no user handover notes saved.")
+        for key, label in notes.FIELDS.items():
+            if key in data:
+                print("Willow: User note (not verified). " + label + ": " + display_path(data[key]))
+        return 0
+    except (OSError, ValueError) as error:
+        print("Willow: could not read or save handover notes: " + str(error))
+        return 1
 
 
 def cmd_memory(command, argv):
@@ -3886,6 +4505,10 @@ HELP = f"""Willow {__version__} - a companion narrator for blind builders.
   willow history PATH      Read retained file history. Add --folder DIR as needed.
   willow evidence NUMBER   Inspect a fact, its source and content hashes.
   willow record --actor user|agent PATH  Record a declaration for these exact bytes.
+  willow handover          Show user notes; set --working TEXT, --blockers TEXT,
+                            --next TEXT, or --clear. Supports --folder DIR.
+  willow study ACTION      Opt-in metrics: start CODE, mark PHASE, collision,
+                            status, stop, export [PATH]. Supports --folder DIR.
 
 Options for `watch`:
   --narrate                 Say the same verified facts in a more natural voice.
@@ -3907,9 +4530,13 @@ Options for `watch`:
   --nvda-dll PATH           Architecture-matched NVDA controller client DLL.
   --no-briefing             Omit the startup briefing (study baseline condition).
   --no-memory               Do not read or retain project memory in this session.
+  --focus                   Buffer automatic text and speech; review on request.
 
 While watching, type: (Enter) state, diff, recap, briefing, briefing all,
 history PATH, evidence NUMBER, away, back, describe, other, stop, pause, resume,
+focus on/off/status, review, review clear, browse, next, previous, repeat, expand,
+checks, checks all, note working/blockers/next TEXT, note, note clear,
+study start CODE, study mark PHASE, study collision, study stop/status/export,
 faster, slower, quiet, loud, help, q.
 
 Settings live in <project>/.willow/config.json and ~/.willow/config.json.
@@ -3935,6 +4562,10 @@ def main(argv=None):
         return cmd_doctor(rest)
     if cmd == "hook":
         return cmd_hook(rest)
+    if cmd == "study":
+        return cmd_study(rest)
+    if cmd == "handover":
+        return cmd_handover(rest)
     if cmd in ("briefing", "history", "evidence", "record"):
         return cmd_memory(cmd, rest)
     print(HELP)

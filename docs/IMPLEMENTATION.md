@@ -11,7 +11,11 @@
 | User/agent distinction | Content-matched hook evidence, explicit declarations, unknown and mixed labels | Matching/stale/conflicting evidence and live/history consistency tests |
 | Two-layer memory | Bounded recent session snapshots and a separately bounded, indexed file fact ledger | Session/fact retention and rename-history tests |
 | Ordering/filtering | Removed objects/settings/moves before routine facts; failures before edits; routine speech repetition filtering; bounded summaries | Priority, repeated/requested speech and summary tests |
-| Screen-reader overload | Default on-demand speech, pause/resume/stop, request clears routine backlog, text output remains readable | Speech-policy tests; real collision measurements still needed |
+| Screen-reader overload | Default on-demand speech, pause/resume/stop, request clears routine backlog, focus buffers automatic terminal text and speech | Speech/focus-policy tests; real collision measurements still needed |
+| Controlled detail | Keyboard next/previous/repeat/expand on frozen review, file history, return briefing and retained facts | Position, boundary, evidence, snapshot and empty-list regressions |
+| Test freshness | Before/after observed file/Git signatures, retained results, current-state comparison independent of exit code | Real wrapped commands, later edits, changed endpoints, missing observations and restart regressions |
+| Personal continuity | Working/blockers/next user notes returned at startup, labelled unverified and kept out of model/fact/study text | Persistence, privacy, control-character and corrupt-file tests |
+| Opt-in measurements | Separate local ledger of action/count metrics, phase markers, reported collisions, relative-time redacted JSON | Default-off, stop/restart, schema validation, privacy and phase-duration tests |
 | Faithful technical evaluation | Independent explicit fixtures, P/R/F1 and repetition; 110 revisits, timing and storage | `evaluate_memory.py`, report includes host and source hash |
 | Remote formative study | Counterbalanced toy tasks, accessible setup, break/return, interview, acceptance matrix and ethics decisions | Protocol in STUDY.md; not yet conducted |
 
@@ -35,6 +39,13 @@ fingerprints. Unsupported formats still produce file-level facts. Credential
 filenames are excluded; arbitrary secret files cannot all be detected. Setting
 values are not retained. Existing diff functionality still holds source text
 in RAM and prints it when requested. Logs can include command failure text.
+The separate result table retains up to 20 command lines, exit codes, durations
+and endpoint observations; command arguments may themselves contain sensitive
+text. Failure snippets are excluded from that table. Notes are separate plain
+text in `handover.json`. Study metrics use a separate `study.sqlite3` ledger
+with an allowlist; exports do not include source, paths, hashes, commands or
+note text. The study ledger is created only on explicit opt-in and is not
+automatically pruned; stop recording and apply the approved data-retention plan.
 
 Git HEAD and branch identify context. They are not used to infer human/AI
 authorship, and Git is optional. A branch-context change is announced in a
@@ -76,9 +87,17 @@ Native NVDA/JAWS audio, VoiceOver/Orca interaction, installer independence and
 speech-collision behavior require device validation. No universal screen-reader
 speech-idle detection is implemented. Native `say` and Linux engines are
 separate speech channels; text-only and on-demand modes are the common fallback.
+Focus additionally prevents automatic watcher terminal text from interrupting
+screen-reader review; explicit requests are still immediate. Its bounded,
+in-memory review buffer is not a replacement for persistent file history.
 The optional legacy Windows asynchronous voice host may queue speech internally;
 it is disabled by default so the Python queue controls the system-speech backlog.
 `stop` cancels speech, but exact hardware timing requires measurement.
+
+Build/test freshness observes the same bounded file scope and Git context as
+the watcher. Equal endpoints establish only matching observations: external or
+ignored dependencies, actual test coverage and transient reverted edits remain
+unknown. Differing endpoints explicitly make the tested version uncertain.
 
 Optional automatic screenshot capture remains Windows-only. The existing
 legacy narration guard checks numbers, paths and verdict vocabulary; it does

@@ -12,7 +12,9 @@ Every update is a **fact you could check yourself**. Willow never guesses. If it
 cannot verify something, it says so, or says nothing — it never fills the gap.
 
 Version 2.1 adds persistent project memory, return briefings, per-file history,
-recorded authorship, and speech on demand. The implementation is inspired by
+recorded authorship, speech on demand, focus mode, a keyboard change browser,
+observed test-version freshness, handover notes, and opt-in study metrics.
+The implementation is inspired by
 [StateScribe](https://arxiv.org/abs/2604.23749), adapted to code rather than scenes.
 See the [accessible setup guide](docs/SETUP.md), [study protocol](docs/STUDY.md),
 and [implementation and validation notes](docs/IMPLEMENTATION.md).
@@ -84,6 +86,11 @@ return briefing. Automatic changes remain readable as text. Use
 returns to on-demand speech; `resume` enables automatic speech. This does not
 detect when VoiceOver, Orca, NVDA or JAWS is reading; you control the timing.
 
+Use `willow watch --focus` to buffer automatic **text and speech** while you
+work. Type `review` when ready, then `next`, `previous`, `repeat` or `expand`.
+Explicit requests still answer immediately. `focus off` allows new updates
+without dumping the backlog. Focus never hides changes from project memory.
+
 ### Window 2 — you and your AI agent
 
 Work with your agent as normal. When you want to **build or test**, run it
@@ -115,6 +122,15 @@ Type any of these and press Enter:
 | `briefing` / `briefing all` | Changes since your preceding visit, with evidence numbers |
 | `away` / `back` | Save a break baseline, then hear what changed while away |
 | `history PATH` | Retained history for a file, including inferred moves |
+| `browse` | Open the latest 100 retained change facts, one at a time |
+| `next` / `previous` / `repeat` / `expand` | Navigate the active list or inspect its details and evidence |
+| `focus on` / `focus off` / `focus status` | Buffer automatic text and speech, resume new output, or check the buffer |
+| `review` / `review clear` | Browse buffered updates or clear their buffer; facts and logs remain |
+| `checks` / `checks all` | Latest result or last 20, with observed project-version freshness |
+| `note working TEXT` / `note blockers TEXT` / `note next TEXT` | Save personal handover notes, labelled as unverified user notes |
+| `note` / `note clear [FIELD]` | Read notes or clear one/all fields |
+| `study start CODE` / `study stop` / `study status` | Explicitly start, stop or check local study metrics |
+| `study mark PHASE` / `study collision` / `study export [PATH]` | Mark a phase, report speech overlap, or export redacted metrics |
 | `evidence NUMBER` | The recorded source, category, authorship and endpoint hashes |
 | `pause` / `resume` | On-demand / automatic speech at natural pauses |
 | `describe` | What your app **looks** like right now |
@@ -128,6 +144,22 @@ Type any of these and press Enter:
 `stop`, `faster` and `slower` matter more than they look. Willow's default rate
 is set for a screen-reader user, not a first-time listener — and being three
 announcements behind with no way to skip is worse than missing one.
+
+`willow run` observes hashes and Git context before and after the command.
+`checks` tells you if later edits differ, or if the command changed files and
+the tested version is uncertain. Matching endpoints do not establish coverage
+or detect temporary edits that were reverted during a command.
+
+You can manage notes without a watcher using `willow handover --next "Review
+the failing test" --folder PATH`. Notes return at startup, stay out of factual
+history and announcement logs, and are never sent for model narration.
+
+Study recording stays off until `study start P01`. The separate local ledger
+accepts counts, canonical action names, relative timings and restricted phase
+codes. Its export excludes source, paths, command arguments, notes and
+announcement text. Recording continues across watcher restarts until `study
+stop`; active recording is announced at startup. Use participant codes and
+approved consent procedures. See the [study recording protocol](docs/STUDY.md).
 
 ---
 
