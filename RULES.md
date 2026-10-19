@@ -226,3 +226,84 @@ In `.willow/config.json` (see the README), not in the source:
 - `stuck_threshold = 3` — failing episodes before "stuck" is announced.
 - `narrate_timeout = 1.5` — the hard budget for a natural rewording.
 - `voice_rate = 3` — speaking rate, -10 to 10.
+
+## Revisit memory and provenance (2.1)
+
+The examples earlier on this page show the legacy file wording. By default,
+2.1 appends an authorship label to each live file phrase: `[author unknown]`,
+`[agent recorded]`, `[user recorded]`, or `[mixed provenance]`. Set
+`provenance_labels` to false only for the explicit legacy study condition.
+New memory descriptions always use fixed wording, even with narration enabled.
+The default stuck summary says `PATH changed in N recorded attempts that each
+ended with 'COMMAND' failing`; it does not assign unknown edits to the agent.
+
+| Recorded condition | Wording / behavior |
+|---|---|
+| No previous session | `This is the first recorded session. I saved a baseline for your next visit.` |
+| Reopen without changes | `Since your last checkpoint, DATE: no verified net file changes.` |
+| Unclean preceding exit | Append `The previous session ended without a final checkpoint.` |
+| Unreadable path | Keep its last known state; append `Some paths could not be read; I have not treated them as deleted.` |
+| File appears / disappears / changes | `PATH appeared`, `PATH removed`, or `PATH modified`, followed by authorship |
+| Unique identical-content move | `OLD moved to NEW (identical content; inferred move)`, followed by authorship |
+| Ambiguous identical content | Separate additions/removals; no move verdict |
+| Structured setting change | `setting FIELD modified in PATH`, followed by authorship |
+| Package appears / disappears | `package FIELD appeared in PATH` or `package FIELD removed in PATH`, followed by authorship |
+| Matching recorded agent content | `agent (recorded)`; source is inspectable |
+| Matching human declaration | `you (recorded)`; evidence says it is a declaration |
+| Missing or stale provenance | `author unknown` |
+| Conflicting matching provenance | `mixed provenance` |
+| Evidence | Append `Evidence NUMBER.`; `evidence NUMBER` prints the source and endpoint hashes |
+
+Recent snapshots and per-file history persist in `.willow/memory.sqlite3`.
+Session/fact retention is bounded independently. A return briefing reports net
+changes after the preceding checkpoint, not every intermediate event. Corrupt
+memory produces an explicit unverifiable-briefing message, never an empty
+baseline pretending no changes occurred. A standalone `willow briefing` does
+not advance memory or assign new evidence IDs.
+
+`away` saves an interruption baseline and selects on-demand speech; `back`
+compares against it and restores the preceding speech mode. A second `away`
+does not reset the baseline. An aggregate break fact reuses recorded authorship
+only when its before and after hashes match a retained fact after that baseline.
+
+## Speech policy (2.1)
+
+- Default `speech_mode` is `on-demand`. Startup instructions and the return
+  briefing are spoken; automatic change episodes are text only. Requests are
+  spoken unless voice is disabled. `--speech auto` or `resume` enables speech
+  at episode boundaries; `pause` returns to on-demand mode.
+- A tick that observes a new write cannot also establish a natural quiet
+  period. A subsequent quiet tick or an actual command result ends the episode.
+- Within an automatic episode, failures precede routine file changes. Existing
+  priority queues retain urgent items. A typed request clears the old speech
+  backlog before it is answered.
+- At most `briefing_limit` details (default 5) are spoken in one summary. All
+  details are printed. Briefings offer `briefing all` for expansion.
+- Identical routine automatic speech is filtered within `repeat_seconds`
+  (default 15). Explicit requests and distinct checkpoints with urgent results
+  are not repetition-filtered. Quiet mode suppresses routine automatic speech.
+- `--no-voice` uses text throughout, including startup and doctor. Unsupported
+  Windows screen-reader bridges report their system-speech fallback explicitly.
+- macOS uses `say`. Linux tries `spd-say`, then `espeak` if missing or unsuccessful.
+  NVDA uses a user-provided controller DLL; JAWS uses its installed active COM
+  interface. These bridges do not establish universal screen-reader idle timing.
+
+`test_memory.py` covers new categories, recovery, evidence, provenance,
+break/reopen behavior and speech policy. `evaluate_memory.py` compares outputs
+to an independently specified synthetic oracle; it does not establish usability.
+
+## OpenAI and Codex
+
+Direct OpenAI calls use Responses by default. Compatible servers and the
+explicit `openai_api: "chat-completions"` option retain Chat Completions.
+Refused, incomplete, failed or malformed Responses output is not narrated.
+Memory facts and provenance are never rewritten by a model.
+
+Codex setup preserves AGENTS.md and merges project-local hooks. Codex requires
+the user to review/trust hooks in its own interface. Willow never approves
+tools or requests continuation. A matched before/after patch observation can
+record agent activity; missing/stale observations and uninstrumented shell
+edits retain unknown authorship. `Stop` says `Codex has finished its turn`;
+`PermissionRequest` says `Codex is requesting your permission`. Neither implies
+a test verdict. Only an explicit integer exit code or `willow run` establishes
+pass/fail. These cases are pinned in `test_openai.py`.

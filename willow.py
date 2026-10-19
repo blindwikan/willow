@@ -57,10 +57,15 @@ import queue
 import subprocess
 import platform
 import base64
+import sqlite3
+import uuid
+import ast
+import contextlib
+import argparse
 import urllib.request
 import urllib.error
 
-__version__ = "2.0"
+__version__ = "2.1"
 
 # --------------------------------------------------------------------------
 # Defaults (every one of these can be changed in .willow/config.json)
@@ -77,17 +82,31 @@ DEFAULTS = {
     "voice": True,              # speak out loud at all
     "voice_rate": 3,            # -10 (slowest) .. 10 (fastest). Screen-reader
                                 # users usually want this well above 0.
-    "voice_host": True,         # Windows: keep one voice process alive instead
+    "voice_host": False,        # Windows: optional legacy asynchronous host.
                                 # of starting one per sentence (much faster to
-                                # the first word). Willow tests it at startup
+                                # the first word). Disabled by default so the
+                                # Python priority queue controls the backlog.
+                                # Willow tests it at startup
                                 # and quietly falls back if it misbehaves.
     "verbosity": "normal",      # "normal" or "quiet" (quiet = speak only the
                                 # important things; everything is still printed)
+    "speech_mode": "on-demand", # auto = speak at episode boundaries;
+                                # on-demand = speak only answers you request
+    "speech_backend": "auto",   # auto | system | nvda | jaws
+    "nvda_dll": None,           # optional path to NVDA's controller client DLL
+    "repeat_seconds": 15,
+    "briefing_limit": 5,
+    "memory_sessions": 30,
+    "memory_facts": 10000,
+    "provenance_labels": True,
+    "memory_enabled": True,
+    "startup_briefing": True,
 
     # --- optional model use (narration + describe) ---
     "provider": "auto",         # auto | anthropic | openai | ollama |
                                 #   openai-compat | none
     "base_url": None,           # override the provider's endpoint
+    "openai_api": "responses", # responses | chat-completions (legacy)
     "text_model": None,         # None = the provider picks a sensible default
     "vision_model": None,
     "narrate_timeout": 1.5,     # HARD budget. Late narration is worse than none.
@@ -168,6 +187,28 @@ def load_config(folder, overrides=None):
 
     if overrides:
         cfg.update({k: v for k, v in overrides.items() if v is not None})
+    # Hand-edited settings must not turn a silent failure into a hung watcher.
+    for key, low, high, kind in (
+            ("voice_rate", -10, 10, int), ("poll_seconds", 0.05, 60, float),
+            ("quiet_seconds", 0, 300, float), ("repeat_seconds", 0, 3600, float),
+            ("briefing_limit", 1, 100, int), ("memory_sessions", 1, 1000, int),
+            ("memory_facts", 1, 1000000, int)):
+        try:
+            value = kind(cfg[key])
+            if not low <= value <= high:
+                raise ValueError()
+            cfg[key] = value
+        except (ValueError, TypeError, OverflowError):
+            print(f"Willow: invalid {key}; using the default.", file=sys.stderr)
+            cfg[key] = DEFAULTS[key]
+    for key, choices in (("speech_mode", ("auto", "on-demand")),
+                         ("speech_backend", ("auto", "system", "nvda", "jaws")),
+                         ("openai_api", ("responses", "chat-completions"))):
+        if cfg[key] not in choices:
+            print(f"Willow: invalid {key}; using the default.", file=sys.stderr)
+            cfg[key] = DEFAULTS[key]
+    if not isinstance(cfg["extra_ignore_dirs"], list):
+        cfg["extra_ignore_dirs"] = []
     return cfg
 
 
@@ -188,14 +229,22 @@ def _post_json(url, headers, payload, timeout):
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers=dict(headers, **{"content-type": "application/json"}))
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        error.close()
+        raise
 
 
 def _get_json(url, timeout, headers=None):
     req = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        error.close()
+        raise
 
 
 def read_key_file(name):
@@ -340,21 +389,26 @@ class OpenAICompatProvider(Provider):
             h["Authorization"] = "Bearer " + self.api_key
         return h
 
-    def _token_key(self):
+    def _token_key(self, model=None):
         # Some newer OpenAI models reject `max_tokens` and want
         # `max_completion_tokens`. Choose by model name, and retry on 400.
-        m = (self.text_model or "").lower()
-        if m.startswith(("o1", "o3", "o4", "gpt-5")):
+        m = (model or self.text_model or "").lower()
+        if m.startswith(("o1", "o3", "o4", "gpt-5", "gpt-6")):
             return "max_completion_tokens"
         return "max_tokens"
 
     def _chat(self, messages, model, max_tokens, timeout):
         url = self.base_url + "/chat/completions"
-        for key in (self._token_key(), "max_tokens", "max_completion_tokens"):
+        deadline = time.monotonic() + timeout
+        for key in dict.fromkeys((self._token_key(model), "max_tokens", "max_completion_tokens")):
             payload = {"model": model, "messages": messages, key: max_tokens}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
             try:
-                data = _post_json(url, self._headers(), payload, timeout)
+                data = _post_json(url, self._headers(), payload, remaining)
             except urllib.error.HTTPError as e:
+                e.close()
                 if e.code == 400:
                     continue          # try the other token parameter name
                 return None
@@ -385,6 +439,50 @@ class OpenAICompatProvider(Provider):
                  "image_url": {"url": "data:image/png;base64," + b64}},
             ]},
         ], self.vision_model, max_tokens, timeout)
+
+
+class OpenAIProvider(OpenAICompatProvider):
+    """Direct OpenAI Responses API, over the standard-library HTTP transport.
+
+    Keep compatible/local servers on Chat Completions. No OpenAI SDK dependency
+    is needed, so Python compatibility does not depend on its release schedule.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.label = f"OpenAI Responses ({self.text_model})"
+
+    def _response(self, system, content, model, max_tokens, timeout):
+        try:
+            data = _post_json(self.base_url + "/responses", self._headers(), {
+                "model": model, "instructions": system, "input": content,
+                "max_output_tokens": max_tokens, "store": False,
+            }, timeout)
+            # Do not speak incomplete reasoning, refusals or truncated output.
+            if not isinstance(data, dict) or data.get("status") != "completed":
+                return None
+            pieces = []
+            for item in data.get("output", []):
+                if not isinstance(item, dict) or item.get("type") != "message":
+                    continue
+                for part in item.get("content", []):
+                    if part.get("type") == "refusal":
+                        return None
+                    if part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                        pieces.append(part["text"])
+            return " ".join(p.strip() for p in pieces if p.strip()) or None
+        except Exception:
+            return None
+
+    def text(self, system, user, max_tokens, timeout):
+        return self._response(system, user, self.text_model, max_tokens, timeout)
+
+    def vision(self, system, prompt, png_bytes, max_tokens, timeout):
+        b64 = base64.standard_b64encode(png_bytes).decode("ascii")
+        content = [{"role": "user", "content": [
+            {"type": "input_text", "text": prompt},
+            {"type": "input_image", "image_url": "data:image/png;base64," + b64},
+        ]}]
+        return self._response(system, content, self.vision_model, max_tokens, timeout)
 
 
 class OllamaProvider(OpenAICompatProvider):
@@ -563,7 +661,8 @@ def resolve_provider(cfg):
     if choice == "anthropic":
         return AnthropicProvider(base_url=base, text_model=tm, vision_model=vm)
     if choice == "openai":
-        return OpenAICompatProvider(base_url=base, text_model=tm, vision_model=vm)
+        cls = OpenAICompatProvider if cfg.get("openai_api") == "chat-completions" else OpenAIProvider
+        return cls(base_url=base, text_model=tm, vision_model=vm)
     if choice == "ollama":
         return OllamaProvider(base_url=base, text_model=tm, vision_model=vm)
     if choice in ("openai-compat", "compat", "local"):
@@ -571,7 +670,8 @@ def resolve_provider(cfg):
                                     vision_model=vm, require_key=False)
 
     for candidate in (AnthropicProvider(base_url=base, text_model=tm, vision_model=vm),
-                      OpenAICompatProvider(base_url=base, text_model=tm, vision_model=vm),
+                      (OpenAICompatProvider if cfg.get("openai_api") == "chat-completions" else
+                       OpenAIProvider)(base_url=base, text_model=tm, vision_model=vm),
                       OllamaProvider(base_url=base, text_model=tm, vision_model=vm)):
         if candidate.available():
             return candidate
@@ -674,6 +774,82 @@ P_NORMAL = 1      # routine file changes
 MAX_PENDING_NORMAL = 4   # beyond this, drop the oldest routine announcements
 
 
+class ScreenReaderBridge:
+    """Optional Windows bridges. No DLLs or Python packages are bundled.
+
+    Use an architecture-matched NVDA controller DLL supplied by the user.
+    JAWS uses its installed COM API through Windows PowerShell.
+    """
+    def __init__(self, backend="auto", nvda_dll=None):
+        self.backend, self.client = "system", None
+        self.problem = None
+        if platform.system() != "Windows":
+            if backend in ("nvda", "jaws"):
+                self.problem = backend + " speech is only available on Windows; using system speech"
+            return
+        if backend in ("auto", "nvda"):
+            import ctypes
+            path = nvda_dll or os.environ.get("WILLOW_NVDA_DLL")
+            if path:
+                try:
+                    client = ctypes.WinDLL(os.path.abspath(os.path.expanduser(path)))
+                    client.nvdaController_speakText.argtypes = [ctypes.c_wchar_p]
+                    client.nvdaController_speakText.restype = ctypes.c_ulong
+                    client.nvdaController_cancelSpeech.restype = ctypes.c_ulong
+                    client.nvdaController_testIfRunning.restype = ctypes.c_ulong
+                    if client.nvdaController_testIfRunning() == 0:
+                        self.backend, self.client = "nvda", client
+                        return
+                except (OSError, AttributeError):
+                    pass
+            if backend == "nvda":
+                self.problem = "NVDA is unavailable. Start NVDA and set nvda_dll to its controller DLL; using system speech"
+        if backend == "jaws":
+            script = ("try { $ErrorActionPreference='Stop';"
+                      "$j=New-Object -ComObject FreedomSci.JawsApi;"
+                      "if (-not $j.SayString('', $false)) { exit 1 }; exit 0 } catch { exit 1 }")
+            try:
+                result = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        timeout=5, creationflags=0x08000000)
+                if result.returncode == 0:
+                    self.backend = "jaws"
+                    return
+            except (OSError, subprocess.SubprocessError):
+                pass
+            self.problem = "JAWS COM speech is unavailable. Start JAWS; using system speech"
+
+    @staticmethod
+    def desktop_available():
+        if platform.system() != "Windows":
+            return True
+        import ctypes
+        from ctypes import wintypes
+        user = ctypes.WinDLL("user32", use_last_error=True)
+        user.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        user.OpenInputDesktop.restype = wintypes.HANDLE
+        user.SwitchDesktop.argtypes = [wintypes.HANDLE]
+        user.CloseDesktop.argtypes = [wintypes.HANDLE]
+        desktop = user.OpenInputDesktop(0, False, 0x0100)
+        if not desktop:
+            return False
+        try:
+            return bool(user.SwitchDesktop(desktop))
+        finally:
+            user.CloseDesktop(desktop)
+
+    def speak(self, text):
+        if self.backend == "nvda":
+            if self.client.nvdaController_speakText(text) != 0:
+                raise RuntimeError("NVDA did not accept the announcement")
+            return True
+        return False
+
+    def cancel(self):
+        if self.backend == "nvda":
+            self.client.nvdaController_cancelSpeech()
+
+
 class Speaker:
     """Speaks announcements aloud, in its own thread.
 
@@ -689,13 +865,16 @@ class Speaker:
     """
 
     def __init__(self, enabled=True, rate=3, narrator=None, on_spoken=None,
-                 use_host=True):
+                 use_host=True, backend="system", nvda_dll=None):
         self.enabled = enabled
         self.rate = int(rate)
         self.use_host = use_host
         self.narrator = narrator      # optional: rewords facts more naturally
         self.on_spoken = on_spoken    # called with (facts, spoken) for the log
         self.system = platform.system()
+        self.bridge = ScreenReaderBridge(backend, nvda_dll) if enabled else None
+        if self.bridge and self.bridge.problem:
+            print("Willow: " + self.bridge.problem + ".", flush=True)
         self.q = queue.PriorityQueue()
         self._seq = 0
         self._seq_lock = threading.Lock()
@@ -793,6 +972,10 @@ class Speaker:
                           "computer; text updates will still appear.", flush=True)
 
     def _cancel_current(self):
+        if self.bridge:
+            self.bridge.cancel()
+            if self.bridge.backend == "jaws":
+                self._jaws_command(cancel=True)
         if self._host is not None:
             self._send("X")
         child = self._child
@@ -903,6 +1086,14 @@ while ($true) {
         if not one_line:
             return
         if self.system == "Windows":
+            if not ScreenReaderBridge.desktop_available():
+                return  # Do not expose project information on the lock screen.
+            if self.bridge and self.bridge.speak(one_line):
+                return
+            if self.bridge and self.bridge.backend == "jaws":
+                if self._jaws_command(text=one_line):
+                    return
+                raise RuntimeError("JAWS did not accept the announcement")
             if self._ensure_host():
                 payload = base64.standard_b64encode(
                     one_line.encode("utf-8")).decode("ascii")
@@ -930,10 +1121,25 @@ while ($true) {
                     self._child = subprocess.Popen(
                         argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     self._child.wait()
-                    return
+                    if self._child.returncode == 0:
+                        return
                 except FileNotFoundError:
                     continue
             raise RuntimeError("no speech engine found (tried spd-say, espeak)")
+
+    def _jaws_command(self, text="", cancel=False):
+        action = "$j.StopSpeech(); exit 0" if cancel else (
+            "if ($j.SayString($env:WILLOW_SPEAK_TEXT, $false)) { exit 0 } else { exit 1 }")
+        script = ("try { $ErrorActionPreference='Stop'; $j=New-Object -ComObject FreedomSci.JawsApi; "
+                  + action + " } catch { exit 1 }")
+        try:
+            p = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                               env=dict(os.environ, WILLOW_SPEAK_TEXT=text),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=5, creationflags=0x08000000)
+            return p.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
 
     def _speak_windows_oneshot(self, one_line):
         """Fallback when the long-lived host isn't usable.
@@ -1242,6 +1448,8 @@ Write-Output ("OK`t" + $name + "`t" + $title)
 # ==========================================================================
 
 def is_ignored(relpath, ignore_dirs=None):
+    if private_path(relpath):
+        return True
     ignore_dirs = ignore_dirs or IGNORE_DIRS
     parts = relpath.replace("\\", "/").split("/")
     for p in parts[:-1]:
@@ -1300,25 +1508,36 @@ class Eyes:
         self.text_bytes = 0
         self.recent = {}     # rel -> ticks remaining of forced re-hashing
         self.unreadable = set()
+        self.scan_errors = set()
         self._last_look_ns = time.time_ns()
 
     # ---- phase one: directory entries only (cheap) -----------------------
 
     def _walk_meta(self):
         meta, stack = {}, [self.folder]
+        self.scan_errors = set()
         while stack:
             cur = stack.pop()
             try:
                 entries = list(os.scandir(cur))
             except OSError:
+                prefix = os.path.relpath(cur, self.folder)
+                prefix = "" if prefix == "." else prefix
+                self.scan_errors.add(prefix)
+                for rel, item in self.meta.items():
+                    if not prefix or rel.startswith(prefix + os.sep):
+                        meta[rel] = item
                 continue
             for e in entries:
                 try:
+                    if e.is_symlink():
+                        continue
                     if e.is_dir(follow_symlinks=False):
                         if e.name not in self.ignore_dirs:
                             stack.append(e.path)
                         continue
                 except OSError:
+                    self.scan_errors.add(os.path.relpath(e.path, self.folder))
                     continue
                 rel = os.path.relpath(e.path, self.folder)
                 if is_ignored(rel, self.ignore_dirs):
@@ -1331,6 +1550,7 @@ class Eyes:
                     # rather than pretending it was deleted.
                     if rel in self.meta:
                         meta[rel] = self.meta[rel]
+                    self.scan_errors.add(rel)
         return meta
 
     # ---- phase two: read + hash only what moved --------------------------
@@ -1341,7 +1561,9 @@ class Eyes:
             with open(full, "rb") as f:
                 data = f.read()
         except OSError:
+            self.unreadable.add(rel)
             return None, None
+        self.unreadable.discard(rel)
         digest = hashlib.sha1(data).hexdigest()
         text = None
         if keep_text and len(data) <= MAX_DIFF_BYTES:
@@ -1417,6 +1639,7 @@ class Eyes:
 
         for rel in gone:
             self.hashes.pop(rel, None)
+            self.unreadable.discard(rel)
             self.text_bytes -= len(self.text.pop(rel, ""))
 
         self.recent = {r: n - 1 for r, n in self.recent.items() if n > 1}
@@ -1593,6 +1816,309 @@ def normalize_exit_code(code):
 
 
 # ==========================================================================
+# Persistent revisit memory. Only hashes and structured facts, never source text.
+# ==========================================================================
+
+def private_path(path):
+    """Do not retain credentials in memory, or narrate their contents."""
+    name = os.path.basename(path).lower()
+    return (name == ".env" or name.startswith(".env.")
+            or name.endswith((".pem", ".key", ".p12", ".pfx"))
+            or name in ("credentials.json", "id_rsa", "id_ed25519"))
+
+
+def display_path(path):
+    # Filenames are untrusted terminal input. Preserve printable Unicode, but
+    # escape controls (including bidi overrides) so a path cannot forge output.
+    import unicodedata
+    return "".join(c if not unicodedata.category(c).startswith("C")
+                   else "\\u%04x" % ord(c) for c in str(path))
+
+
+def structured_attributes(path, text):
+    """Fingerprints of JSON settings / manifest dependencies. No raw values.
+
+    A changed setting can be reported without keeping passwords or source.
+    Invalid, binary, and unsupported formats fall back to a file-level change.
+    """
+    if not text or private_path(path):
+        return {}
+    values = {}
+    name = os.path.basename(path).lower()
+    try:
+        if name.endswith(".json"):
+            data = json.loads(text)
+            if not isinstance(data, dict):
+                return {}
+            def visit(obj, prefix="", depth=0):
+                if depth > 5 or len(values) >= 500:
+                    return
+                for key, value in sorted(obj.items()):
+                    if re.search(r"secret|password|token|credential|api.?key", key, re.I):
+                        continue
+                    field = (prefix + "." + key) if prefix else key
+                    if isinstance(value, dict):
+                        visit(value, field, depth + 1)
+                    else:
+                        values[field] = value
+            visit(data)
+        elif name == "pyproject.toml":
+            # tomllib is available on Python >= 3.11. A narrow literal parser
+            # keeps supported project metadata working on 3.8, too.
+            try:
+                import tomllib
+            except ImportError:
+                tomllib = None
+            if tomllib:
+                project = tomllib.loads(text).get("project", {})
+                for key in ("version", "requires-python"):
+                    if key in project:
+                        values["project." + key] = project[key]
+                deps = project.get("dependencies", [])
+            else:
+                section = re.search(r"(?ms)^\[project\]\s*\n(.*?)(?=^\[|\Z)", text)
+                body = section.group(1) if section else ""
+                for key in ("version", "requires-python"):
+                    match = re.search(r'(?m)^' + key + r'\s*=\s*([\'"].*?[\'"])', body)
+                    if match:
+                        values["project." + key] = ast.literal_eval(match.group(1))
+                match = re.search(r"(?s)\bdependencies\s*=\s*(\[.*?\])", body)
+                deps = ast.literal_eval(match.group(1)) if match else []
+            for dep in deps:
+                match = re.match(r"([A-Za-z0-9_.-]+)", str(dep))
+                if match:
+                    values["dependencies." + match.group(1).lower()] = dep
+        elif name.startswith("requirements") and name.endswith(".txt"):
+            for line in text.splitlines():
+                match = re.match(r"\s*([A-Za-z0-9_.-]+)\s*([<>=!~].*)?$", line)
+                if match:
+                    values["dependencies." + match.group(1).lower()] = line.strip()
+    except (ValueError, TypeError, SyntaxError, RecursionError):
+        return {}
+    return {key: hashlib.sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()
+            for key, value in values.items()}
+
+
+def git_context(folder):
+    """Git identifies revisions, never the person/agent responsible for bytes."""
+    result = {}
+    for key, args in (("head", ["rev-parse", "HEAD"]),
+                      ("branch", ["symbolic-ref", "--short", "-q", "HEAD"])):
+        try:
+            p = subprocess.run(["git", "-C", folder] + args, capture_output=True,
+                               text=True, encoding="utf-8", errors="replace", timeout=3)
+            if p.returncode == 0:
+                result[key] = p.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return result
+
+
+def memory_snapshot(eyes, previous=None):
+    files = {p.replace("\\", "/"): {
+        "hash": digest,
+        "attributes": structured_attributes(p, eyes.current_text(p))}
+        for p, digest in eyes.snapshot_hashes().items() if not private_path(p)}
+    uncertain = [p.replace("\\", "/") for p in
+                 (set(getattr(eyes, "scan_errors", ())) | eyes.unreadable)]
+    # Preserve the last known hashes of temporarily unreadable files/directories.
+    for path, item in (previous or {}).get("files", {}).items():
+        if path not in files and any(not p or path == p or path.startswith(p + "/")
+                                     for p in uncertain):
+            files[path] = item
+    return {"files": files, "uncertain": uncertain}
+
+
+def compare_snapshots(before, after, provenance=()):
+    """Deterministic net changes. Uncertain observations never imply deletion.
+
+    Identical-content moves are candidates, not proof of a rename operation.
+    Ambiguous identical files remain separate additions/removals.
+    """
+    old, new = before.get("files", {}), after.get("files", {})
+    uncertain = after.get("uncertain", [])
+    def known(path):
+        return not any(not p or path == p or path.startswith(p + "/") for p in uncertain)
+    added = {p for p in new.keys() - old.keys() if known(p)}
+    removed = {p for p in old.keys() - new.keys() if known(p)}
+    changes = []
+    def add(category, action, path, old_path=None, field=None):
+        prev = old.get(old_path or path, {})
+        cur = new.get(path, {})
+        actor, evidence = "unknown", "filesystem hashes"
+        # A hash-matched hook is evidence about the current content, not a
+        # guarantee of exclusive authorship. Labels deliberately say 'recorded'.
+        matching = [p for p in provenance if p.get("path") == path
+                    and p.get("after_hash") == cur.get("hash")
+                    and p.get("actor") in ("agent", "user")]
+        actors = {p["actor"] for p in matching}
+        if len(actors) == 1:
+            actor = actors.pop()
+            evidence = matching[-1].get("source", "explicit declaration")
+        elif len(actors) > 1:
+            actor, evidence = "mixed", "conflicting recorded provenance"
+        rank = 0 if action == "removed" else 1 if field or category == "spatial" else 2
+        changes.append({"category": category, "action": action, "path": path,
+                        "old_path": old_path, "field": field, "actor": actor,
+                        "evidence": evidence, "before_hash": prev.get("hash"),
+                        "after_hash": cur.get("hash"),
+                        "before_value_hash": prev.get("attributes", {}).get(field) if field else None,
+                        "after_value_hash": cur.get("attributes", {}).get(field) if field else None,
+                        "priority": rank})
+    for path in sorted(removed.copy()):
+        matches = [p for p in added if new[p]["hash"] == old[path]["hash"]]
+        same_old = [p for p in removed if old[p]["hash"] == old[path]["hash"]]
+        if len(matches) == 1 and len(same_old) == 1:
+            dest = matches[0]
+            add("spatial", "relocated", dest, old_path=path)
+            added.remove(dest)
+            removed.remove(path)
+    for path in sorted(removed):
+        add("object", "removed", path)
+    for path in sorted(added):
+        add("object", "appeared", path)
+    for path in sorted(old.keys() & new.keys()):
+        if not known(path) or old[path]["hash"] == new[path]["hash"]:
+            continue
+        attrs_before, attrs_after = old[path].get("attributes", {}), new[path].get("attributes", {})
+        fields = sorted(k for k in attrs_before.keys() | attrs_after.keys()
+                        if attrs_before.get(k) != attrs_after.get(k))
+        add("attribute", "modified", path)
+        for field in fields:
+            package = field.startswith(("dependencies.", "devDependencies.",
+                                        "optionalDependencies.", "peerDependencies."))
+            if field not in attrs_before:
+                add("object" if package else "attribute", "appeared", path, field=field)
+            elif field not in attrs_after:
+                add("object" if package else "attribute", "removed", path, field=field)
+            else:
+                add("attribute", "modified", path, field=field)
+    return sorted(changes, key=lambda c: (c["priority"], c["path"], c.get("field") or ""))
+
+
+def change_sentence(change):
+    path = display_path(change["path"])
+    field = change.get("field")
+    if field:
+        thing = "package" if field.startswith(("dependencies.", "devDependencies.",
+                                                "optionalDependencies.", "peerDependencies.")) else "setting"
+        phrase = f"{thing} {display_path(field)} {change['action']} in {path}"
+    elif change["category"] == "spatial":
+        phrase = f"{display_path(change['old_path'])} moved to {path} (identical content; inferred move)"
+    else:
+        phrase = f"{path} {change['action']}"
+    actor = {"unknown": "author unknown", "user": "you (recorded)",
+             "agent": "agent (recorded)", "mixed": "mixed provenance"}[change["actor"]]
+    return f"{phrase}; {actor}"
+
+
+class ProjectMemory:
+    """SQLite transactions keep checkpoint + facts together, including on crash.
+
+    Recent session snapshots form episodic memory. Indexed, bounded fact rows
+    form per-file temporal memory. Each call owns/closes its connection, so
+    command handlers and the watcher can safely run in different threads.
+    """
+
+    def __init__(self, folder, cfg):
+        self.folder, self.cfg = folder, cfg
+        self.path = os.path.join(folder, WILLOW_DIR, "memory.sqlite3")
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.session_id = None
+        with self.db() as db:
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version not in (0, 1):
+                raise ValueError("memory was created by a newer Willow")
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id TEXT PRIMARY KEY, started REAL, updated REAL,
+                    closed INTEGER, snapshot TEXT, context TEXT);
+                CREATE TABLE IF NOT EXISTS facts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT,
+                    at REAL, path TEXT, old_path TEXT, data TEXT);
+                CREATE INDEX IF NOT EXISTS facts_path ON facts(path, id);
+                CREATE INDEX IF NOT EXISTS facts_old_path ON facts(old_path, id);
+                PRAGMA user_version=1;
+            """)
+
+    @contextlib.contextmanager
+    def db(self):
+        db = sqlite3.connect(self.path, timeout=3)
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
+
+    def latest(self):
+        with self.db() as db:
+            row = db.execute("SELECT id, updated, closed, snapshot, context FROM sessions "
+                             "ORDER BY updated DESC LIMIT 1").fetchone()
+        if not row:
+            return None
+        saved, context = json.loads(row[3]), json.loads(row[4])
+        if (not isinstance(saved, dict) or not isinstance(saved.get("files"), dict)
+                or not isinstance(context, dict)
+                or not isinstance(saved.get("uncertain", []), list)):
+            raise ValueError("invalid saved memory snapshot")
+        for path, item in saved["files"].items():
+            if (not isinstance(item, dict) or not isinstance(item.get("hash"), str)
+                    or not isinstance(item.get("attributes", {}), dict)):
+                raise ValueError("invalid saved file record")
+        return {"id": row[0], "at": row[1], "closed": bool(row[2]),
+                "snapshot": saved, "context": context}
+
+    def begin(self, snapshot, context, changes):
+        self.session_id = uuid.uuid4().hex
+        self.checkpoint(snapshot, context, changes, started=True)
+
+    def checkpoint(self, snapshot, context, changes=(), closed=False, started=False):
+        if not self.session_id:
+            return
+        now = time.time()
+        with self.db() as db:
+            if started:
+                db.execute("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)",
+                           (self.session_id, now, now, int(closed),
+                            json.dumps(snapshot), json.dumps(context)))
+            else:
+                db.execute("UPDATE sessions SET updated=?, closed=?, snapshot=?, context=? WHERE id=?",
+                           (now, int(closed), json.dumps(snapshot), json.dumps(context), self.session_id))
+            for change in changes:
+                cur = db.execute("INSERT INTO facts (session, at, path, old_path, data) VALUES (?, ?, ?, ?, ?)",
+                                 (self.session_id, now, change["path"], change.get("old_path"), json.dumps(change)))
+                change["id"] = cur.lastrowid
+                change["at"] = now
+            db.execute("DELETE FROM sessions WHERE id NOT IN (SELECT id FROM sessions "
+                       "ORDER BY updated DESC LIMIT ?)", (max(1, int(self.cfg["memory_sessions"])),))
+            db.execute("DELETE FROM facts WHERE id NOT IN (SELECT id FROM facts "
+                       "ORDER BY id DESC LIMIT ?)", (max(1, int(self.cfg["memory_facts"])),))
+
+    def history(self, path, limit=20):
+        # Follow move candidates backwards and forwards, retaining evidence.
+        with self.db() as db:
+            rows = db.execute("SELECT id, at, path, old_path, data FROM facts ORDER BY id DESC").fetchall()
+        paths, result = {path.replace("\\", "/")}, []
+        for _ in range(2):
+            for row in rows:
+                if row[2] in paths or row[3] in paths:
+                    paths.add(row[2])
+                    if row[3]:
+                        paths.add(row[3])
+        for row in rows:
+            if row[2] in paths or row[3] in paths:
+                result.append(dict(json.loads(row[4]), id=row[0], at=row[1]))
+                if len(result) >= limit:
+                    break
+        return result
+
+    def evidence(self, fact_id):
+        with self.db() as db:
+            row = db.execute("SELECT id, at, data FROM facts WHERE id=?", (fact_id,)).fetchone()
+        return dict(json.loads(row[2]), id=row[0], at=row[1]) if row else None
+
+
+# ==========================================================================
 # The watcher (Willow's brain) - groups changes into chunks and announces
 # ==========================================================================
 
@@ -1613,6 +2139,11 @@ class Willow:
         self.watching_path = os.path.join(wd, WATCHING_NAME)
         self._log_lock = threading.Lock()
         self._tails = {}     # path -> (offset, file-identity)
+        # Historical results belong to previous sessions. Read them once here
+        # so reopening a project never re-announces an old failure as new.
+        if os.path.exists(os.path.join(wd, "memory.sqlite3")):
+            self._tail_lines(self.inbox_path)
+            self._tail_lines(self.results_path)
 
         self.eyes = Eyes(self.folder, git_ignored_dirs(self.folder)
                          | set(cfg.get("extra_ignore_dirs") or ()))
@@ -1633,6 +2164,216 @@ class Willow:
         self.session = {"episodes": 0, "checks": 0, "failures": 0,
                         "files": set(), "started": time.time()}
         self.stop = threading.Event()
+        self._state_lock = threading.RLock()
+        self._away = None
+        self._output_context = threading.local()
+        self._recent_speech = {}
+        self._episode_provenance = []
+        self.memory = None
+        self.memory_error = None
+        self.return_changes = []
+        self.previous_session = None
+        self._memory_snapshot = memory_snapshot(self.eyes)
+        self._git_context = git_context(self.folder)
+        try:
+            if not cfg.get("memory_enabled", True):
+                raise ValueError("Project memory is switched off in this session")
+            self.memory = ProjectMemory(self.folder, cfg)
+            self.previous_session = self.memory.latest()
+            if self.previous_session:
+                previous = self.previous_session["snapshot"]
+                self._memory_snapshot = memory_snapshot(self.eyes, previous)
+                self.return_changes = compare_snapshots(previous, self._memory_snapshot,
+                                                        self._offline_provenance())
+            self.memory.begin(self._memory_snapshot, self._git_context, self.return_changes)
+        except (OSError, sqlite3.Error, ValueError, TypeError, KeyError) as e:
+            self.memory_error = str(e)
+            self.memory = None
+
+    def _offline_provenance(self):
+        """Use only records newer than the preceding checkpoint, not stale hooks."""
+        records = []
+        try:
+            with open(self.inbox_path, "rb") as f:
+                f.seek(max(0, os.path.getsize(self.inbox_path) - 2_000_000))
+                for line in f:
+                    try:
+                        item = json.loads(line)
+                        if (isinstance(item, dict) and item.get("type") == "write"
+                                and float(item.get("ts", 0)) > self.previous_session["at"]):
+                            rec = self._normal_provenance(item)
+                            if rec:
+                                records.append(rec)
+                    except (ValueError, TypeError):
+                        continue
+        except OSError:
+            pass
+        return records
+
+    def _normal_provenance(self, event):
+        path = event.get("path")
+        if not isinstance(path, str) or not path:
+            return None
+        if not os.path.isabs(path):
+            path = os.path.join(self.folder, path)
+        try:
+            rel = os.path.relpath(os.path.realpath(path), os.path.realpath(self.folder))
+        except ValueError:
+            return None
+        if rel == os.pardir or rel.startswith(os.pardir + os.sep) or is_ignored(rel):
+            return None
+        return {"path": rel.replace("\\", "/"), "actor": event.get("actor", "unknown"),
+                "after_hash": event.get("after_hash"),
+                "source": event.get("source", "unverified write event")}
+
+    def _save_memory(self, closed=False):
+        if not self.memory:
+            return []
+        try:
+            current = memory_snapshot(self.eyes, self._memory_snapshot)
+            self._git_context = git_context(self.folder)
+            changes = compare_snapshots(self._memory_snapshot, current, self._episode_provenance)
+            self.memory.checkpoint(current, self._git_context, changes, closed=closed)
+            self._memory_snapshot = current
+            return changes
+        except (OSError, sqlite3.Error, ValueError, TypeError) as e:
+            self.memory_error = str(e)
+            self.memory = None
+            self.announce("I couldn't save project memory. Live updates still work; "
+                          "the next briefing may be incomplete.", urgent=True)
+            return []
+
+    def _label(self, phrase, path):
+        if not self.cfg.get("provenance_labels", True):
+            return phrase
+        rel = path.replace("\\", "/")
+        digest = self.eyes.hashes.get(path)
+        actors = {p["actor"] for p in self._episode_provenance
+                  if p["path"] == rel and p["after_hash"] == digest
+                  and p["actor"] in ("user", "agent")}
+        actor = (next(iter(actors)) + " recorded" if len(actors) == 1 else
+                 "mixed provenance" if actors else "author unknown")
+        return display_path(phrase) + " [" + actor + "]"
+
+    def _automatic(self, method, *args, **kwargs):
+        self._output_context.automatic = True
+        try:
+            method(*args, **kwargs)
+        finally:
+            self._output_context.automatic = False
+
+    def _speak_output(self, text, urgent=False, narratable=False):
+        automatic = getattr(self._output_context, "automatic", False)
+        if automatic and self.cfg.get("speech_mode") != "auto":
+            return
+        if automatic and self.quiet and not urgent:
+            return
+        now = time.monotonic()
+        if automatic and not urgent:
+            if now - self._recent_speech.get(text, -float("inf")) < self.cfg["repeat_seconds"]:
+                self.event("speech_filtered", reason="repetition")
+                return
+            self._recent_speech = {k: v for k, v in self._recent_speech.items()
+                                   if now - v < self.cfg["repeat_seconds"]}
+            self._recent_speech[text] = now
+        self.speaker.say(text, priority=(P_URGENT if urgent else P_NORMAL),
+                         narratable=narratable)
+
+    def briefing(self, full=False):
+        if self.memory_error:
+            self.announce("I couldn't read or save project memory; I cannot verify "
+                          "a since-you-were-last-here briefing. " + self.memory_error, urgent=True)
+            return
+        if not self.previous_session:
+            self.announce("This is the first recorded session. I saved a baseline "
+                          "for your next visit.", urgent=True)
+            return
+        details = self.return_changes
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(self.previous_session["at"]))
+        extra = " The previous session ended without a final checkpoint." if not self.previous_session["closed"] else ""
+        if self._memory_snapshot.get("uncertain"):
+            extra += " Some paths could not be read; I have not treated them as deleted."
+        prev_context = self.previous_session["context"]
+        if prev_context.get("branch") != self._git_context.get("branch"):
+            extra += " The Git branch context changed; differences may come from switching branches."
+        if not details:
+            self.announce(f"Since your last checkpoint, {stamp}: no verified net file changes." + extra,
+                          urgent=True)
+            return
+        limit = len(details) if full else max(1, int(self.cfg["briefing_limit"]))
+        header = f"Since you were last here, {stamp}: {len(details)} recorded changes." + extra
+        self.announce(header, urgent=True)
+        for change in details[:limit]:
+            self.announce(change_sentence(change) + f". Evidence {change['id']}.", urgent=True)
+        if len(details) > limit:
+            self.announce(f"{len(details) - limit} more changes. Ask for briefing all to hear them.", urgent=True)
+        self.event("briefing", fact_ids=[c["id"] for c in details[:limit]], total=len(details))
+
+    def file_history(self, path):
+        if not self.memory:
+            self.announce("Project history is unavailable. Run willow doctor for details.", urgent=True)
+            return
+        rows = self.memory.history(path)
+        if not rows:
+            self.announce("No retained history for " + display_path(path) + ".", urgent=True)
+        for change in rows:
+            stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(change["at"]))
+            self.announce(stamp + ": " + change_sentence(change)
+                          + f". Evidence {change['id']}.", urgent=True)
+
+    def show_evidence(self, fact_id):
+        change = self.memory.evidence(fact_id) if self.memory else None
+        if not change:
+            self.announce("That evidence is unavailable or outside the retention window.", urgent=True)
+            return
+        self.announce(change_sentence(change) + ". Source: " + change["evidence"] + ".", urgent=True)
+        print(json.dumps(change, ensure_ascii=True, indent=2), flush=True)
+
+    def leave_for_break(self):
+        with self._state_lock:
+            if self._away:
+                self.announce("Your break baseline is already saved. Type back when you return.", urgent=True)
+                return
+            self._tick()
+            if self.ep_touched or self.ep_writes:
+                self._close_episode([])
+            self._away = {"snapshot": memory_snapshot(self.eyes), "at": time.time(),
+                          "context": git_context(self.folder), "closed": True,
+                          "speech_mode": self.cfg["speech_mode"]}
+            self.cfg["speech_mode"] = "on-demand"
+        self.announce("Break baseline saved. Automatic speech paused. Type back for what changed while you were away.", urgent=True)
+
+    def return_from_break(self):
+        with self._state_lock:
+            if not self._away:
+                self.briefing()
+                return
+            self._tick()
+            if self.ep_touched or self.ep_writes:
+                self._close_episode([])
+            if not self.memory:
+                self.announce("Project memory is unavailable; I cannot save evidence for a break briefing.", urgent=True)
+                self.cfg["speech_mode"] = self._away["speech_mode"]
+                self._away = None
+                return
+            current = memory_snapshot(self.eyes, self._away["snapshot"])
+            changes = compare_snapshots(self._away["snapshot"], current)
+            # Reuse the provenance of a retained fact only when both endpoint
+            # hashes match. Intermediate edits cannot establish net authorship.
+            for change in changes:
+                for fact in self.memory.history(change["path"]):
+                    if (fact["at"] >= self._away["at"]
+                            and all(fact.get(k) == change.get(k) for k in
+                                    ("before_hash", "after_hash", "old_path", "field"))):
+                        change["actor"], change["evidence"] = fact["actor"], fact["evidence"]
+                        break
+                change["scope"] = "net changes during break"
+            self.memory.checkpoint(current, git_context(self.folder), changes)
+            self.previous_session = self._away
+            self.return_changes = changes
+            self.cfg["speech_mode"] = self._away["speech_mode"]
+            self._away = None
+        self.briefing()
 
     # ---- output ----------------------------------------------------------
 
@@ -1645,10 +2386,7 @@ class Willow:
         """
         print("Willow: " + text, flush=True)
         self._write_log(text)
-        priority = P_URGENT if urgent else P_NORMAL
-        speak = not (self.quiet and not urgent)
-        if speak:
-            self.speaker.say(text, priority=priority, narratable=narratable)
+        self._speak_output(text, urgent, narratable)
 
     def announce_lines(self, header, details, urgent=False, narratable=False):
         """Speak the collapsed form, but print one detail per line so a screen
@@ -1658,9 +2396,11 @@ class Willow:
             for d in details:
                 print("        - " + d, flush=True)
         self._write_log(header)
-        if not (self.quiet and not urgent):
-            self.speaker.say(header, priority=P_URGENT if urgent else P_NORMAL,
-                             narratable=narratable)
+        limit = max(1, int(self.cfg["briefing_limit"]))
+        spoken = header
+        if len(details) > limit:
+            spoken = ". ".join(details[:limit]) + f". {len(details) - limit} more details are in the text and diff."
+        self._speak_output(spoken, urgent, narratable)
 
     def on_spoken(self, facts, spoken):
         if spoken != facts:
@@ -1694,13 +2434,16 @@ class Willow:
         self._heartbeat()
         extra = " Type help to hear what you can ask me."
         self.announce(f"watching {os.path.basename(self.folder)}. "
-                      "I'll tell you what the agent changes. "
+                      "I'll record what changes. "
                       "Press Enter any time to hear the current state." + extra,
                       urgent=True)
+        if self.cfg.get("startup_briefing", True):
+            self.briefing()
         last_beat = time.time()
         errors = 0
         while not self.stop.is_set():
-            time.sleep(self.cfg["poll_seconds"])
+            if self.stop.wait(self.cfg["poll_seconds"]):
+                break
             try:
                 self._tick()
                 errors = 0
@@ -1725,6 +2468,10 @@ class Willow:
             pass
 
     def _tick(self):
+        with self._state_lock:
+            return self._tick_locked()
+
+    def _tick_locked(self):
         changed, gone = self.eyes.look()
         if changed or gone:
             for rel in changed:
@@ -1746,6 +2493,11 @@ class Willow:
         closers = [e for e in events if e.get("type") != "write"]
         if closers:
             self._close_episode(closers)
+            return
+
+        # Slow filesystem/event reads cannot establish a quiet period during
+        # the very tick that first observed a write. Wait for a quiet tick.
+        if changed or gone or any(e.get("type") == "write" for e in events):
             return
 
         if (self.ep_touched or self.ep_writes) and self.last_change_at is not None:
@@ -1811,14 +2563,24 @@ class Willow:
 
     def _record_write(self, event):
         """An exact write, reported by the harness rather than counted by us."""
+        rec = self._normal_provenance(event)
+        if rec:
+            self._episode_provenance.append(rec)
         path = event.get("path") or ""
+        if not isinstance(path, str) or not path:
+            return
+        if not os.path.isabs(path):
+            path = os.path.join(self.folder, path)
         try:
             rel = os.path.relpath(os.path.abspath(path), self.folder)
         except ValueError:                    # a different drive on Windows
             return
         if rel.startswith("..") or is_ignored(rel, self.eyes.ignore_dirs):
             return
-        n = int(event.get("count") or 1)
+        try:
+            n = max(1, int(event.get("count") or 1))
+        except (ValueError, TypeError):
+            return
         self.ep_writes[rel] = self.ep_writes.get(rel, 0) + n
         self.last_change_at = time.time()
 
@@ -1835,14 +2597,22 @@ class Willow:
             if not line:
                 continue
             try:
-                events.append(json.loads(line))
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    events.append(item)
             except json.JSONDecodeError:
                 continue
         for line in self._tail_lines(self.results_path):
             parsed = parse_result_line(line)
             if parsed is not None:
                 events.append(parsed)
-        return events
+        verified = []
+        for event in events:
+            if event.get("type") == "check" and type(event.get("exit_code")) is not int:
+                verified.append({"type": "notice", "message": "A reported check had no verifiable exit code; I cannot say whether it passed."})
+            else:
+                verified.append(event)
+        return verified
 
     # ---- closing a chunk and deciding what to say (the RULEBOOK) ---------
 
@@ -1869,7 +2639,9 @@ class Willow:
         renamed_to = {new for _old, new in renames}
 
         for old, new in renames:
-            phrase = f"renamed {old} to {new}"
+            phrase = (f"moved {old} to {new} (identical content; inferred move)"
+                      if self.cfg.get("provenance_labels", True) else f"renamed {old} to {new}")
+            phrase = self._label(phrase, new)
             parts.append(phrase)
             details.append(phrase)
             episode_files.append((new, self.committed_text.get(old),
@@ -1901,16 +2673,19 @@ class Willow:
 
             # A silent undo: changed more than once, ends exactly where it began.
             if max(writes, writes_exact.get(rel, 0)) >= 2                     and cur_hash == base_hash and is_there == was_there:
-                reverted.append(f"quietly undid the change to {rel}")
+                reverted.append(self._label(f"quietly undid the change to {rel}", rel))
                 continue
             # Back to the content it had when this session started.
             if is_there and cur_hash == orig_hash and base_hash != orig_hash:
-                reverted.append(f"put {rel} back to the version it had when we started")
+                reverted.append(self._label(f"put {rel} back to the version it had when we started", rel))
                 continue
             # Deleted something it had created during this session. That is a
             # deletion, not a return to an earlier version - there wasn't one.
             if was_there and not is_there and orig_hash is None:
-                phrase = f"deleted {rel}, which it created earlier"
+                phrase = (f"deleted {rel}, which appeared earlier this session"
+                          if self.cfg.get("provenance_labels", True) else
+                          f"deleted {rel}, which it created earlier")
+                phrase = self._label(phrase, rel)
                 file_phrases.append(phrase)
                 episode_files.append((rel, before_text, None, "deleted"))
                 continue
@@ -1926,7 +2701,7 @@ class Willow:
                 phrase += f", written {exact} times"
             elif writes >= 3:
                 phrase += ", changed repeatedly"
-            file_phrases.append(phrase)
+            file_phrases.append(self._label(phrase, rel))
             episode_files.append((rel, before_text, after_text,
                                   "created" if not was_there else
                                   "deleted" if not is_there else "edited"))
@@ -1948,6 +2723,7 @@ class Willow:
 
         # (e) build/test outcomes: a hard fact from a real exit code
         any_failure = False
+        failure_phrases = []
         for check in checks:
             code = normalize_exit_code(check.get("exit_code"))
             cmd = check.get("command", "the check")
@@ -1962,6 +2738,7 @@ class Willow:
                 detail = check.get("detail")
                 if detail:
                     phrase += f". {detail}"
+                failure_phrases.append(phrase)
             parts.append(phrase)
             details.append(phrase)
 
@@ -1977,33 +2754,38 @@ class Willow:
         self.session["failures"] += sum(1 for c in checks if c.get("exit_code") != 0)
         self.session["files"].update(touched)
 
+        changes = self._save_memory()
+        self._episode_provenance = []
         if parts:
+            if self.cfg.get("provenance_labels", True) and failure_phrases:
+                parts = failure_phrases + [p for p in parts if p not in failure_phrases]
+                details = failure_phrases + [p for p in details if p not in failure_phrases]
             line = ". ".join(parts) + "."
             urgent = any_failure or bool(reverted) or bool(notes)
-            self.announce_lines(line, details, urgent=urgent, narratable=True)
+            self._automatic(self.announce_lines, line, details, urgent=urgent,
+                            narratable=not self.cfg.get("provenance_labels", True))
             self.event("episode", facts=line, files=sorted(touched),
-                       checks=checks, reverted=reverted)
+                       checks=checks, reverted=reverted, changes=changes)
         for note in stuck_notes:
-            self.announce(note + ".", urgent=True)
+            self._automatic(self.announce, note + ".", urgent=True)
             self.event("stuck", facts=note)
 
     def _detect_renames(self, touched, exists_before, now_hashes):
-        """A delete and a create in the same chunk with identical content is a
-        rename - and Willow already holds both hashes, so this is certain."""
+        """Unique matching bytes suggest a move; duplicate content is ambiguous."""
         created, deleted = {}, {}
         for rel in touched:
             was = exists_before.get(rel, rel in self.committed)
             is_now = rel in now_hashes
             if not was and is_now:
-                created[now_hashes[rel]] = rel
+                created.setdefault(now_hashes[rel], []).append(rel)
             elif was and not is_now:
                 h = self.committed.get(rel)
                 if h:
-                    deleted[h] = rel
+                    deleted.setdefault(h, []).append(rel)
         pairs = []
         for h, old in deleted.items():
-            if h in created:
-                pairs.append((old, created[h]))
+            if len(old) == 1 and len(created.get(h, [])) == 1:
+                pairs.append((old[0], created[h][0]))
         return sorted(pairs)
 
     def _update_stuck(self, checks, touched):
@@ -2031,8 +2813,10 @@ class Willow:
                 n = self.fail_streak[key]
                 if n >= threshold and key not in self.stuck_announced:
                     self.stuck_announced.add(key)
-                    notes.append(f"the agent has changed {rel} in {n} attempts "
-                                 f"that each ended with '{cmd}' failing")
+                    subject = (f"{rel} changed in {n} recorded attempts "
+                               if self.cfg.get("provenance_labels", True) else
+                               f"the agent has changed {rel} in {n} attempts ")
+                    notes.append(subject + f"that each ended with '{cmd}' failing")
         return notes
 
     # ---- the pull channel: ask any time ----------------------------------
@@ -2198,37 +2982,52 @@ def deliver(record, start=".", warn=True):
 # ==========================================================================
 
 def cmd_watch(argv):
-    narrate = False
-    overrides = {}
-    positional = []
-    i = 0
-    while i < len(argv):
-        a = argv[i]
-        if a in ("--narrate", "-n"):
-            narrate = True
-        elif a == "--quiet":
-            overrides["verbosity"] = "quiet"
-        elif a == "--no-voice":
-            overrides["voice"] = False
-        elif a in ("--provider", "--model", "--base-url", "--rate", "--poll") and i + 1 < len(argv):
-            key = {"--provider": "provider", "--model": "text_model",
-                   "--base-url": "base_url", "--rate": "voice_rate",
-                   "--poll": "poll_seconds"}[a]
-            val = argv[i + 1]
-            overrides[key] = (int(val) if key == "voice_rate"
-                              else float(val) if key == "poll_seconds" else val)
-            i += 1
-        else:
-            positional.append(a)
-        i += 1
-
-    folder = os.path.abspath(positional[0] if positional else ".")
+    parser = argparse.ArgumentParser(prog="willow watch", description="Watch project changes. Speech is on demand by default.")
+    parser.add_argument("folder", nargs="?", default=".")
+    parser.add_argument("--narrate", "-n", action="store_true")
+    parser.add_argument("--quiet", action="store_true", default=None)
+    parser.add_argument("--no-voice", action="store_true", default=None)
+    parser.add_argument("--provider")
+    parser.add_argument("--model", dest="text_model")
+    parser.add_argument("--vision-model")
+    parser.add_argument("--openai-api", choices=("responses", "chat-completions"))
+    parser.add_argument("--base-url")
+    parser.add_argument("--rate", dest="voice_rate", type=int, choices=range(-10, 11))
+    parser.add_argument("--poll", dest="poll_seconds", type=float)
+    parser.add_argument("--speech", dest="speech_mode", choices=("auto", "on-demand"))
+    parser.add_argument("--backend", dest="speech_backend", choices=("auto", "system", "nvda", "jaws"))
+    parser.add_argument("--nvda-dll")
+    parser.add_argument("--no-briefing", action="store_true")
+    parser.add_argument("--no-memory", action="store_true")
+    parser.add_argument("--no-provenance-labels", action="store_true")
+    args = parser.parse_args(argv)
+    narrate = args.narrate
+    overrides = {k: getattr(args, k) for k in
+                 ("provider", "text_model", "vision_model", "openai_api", "base_url", "voice_rate", "poll_seconds",
+                  "speech_mode", "speech_backend", "nvda_dll")}
+    if args.quiet:
+        overrides["verbosity"] = "quiet"
+    if args.no_voice:
+        overrides["voice"] = False
+    if args.no_briefing:
+        overrides["startup_briefing"] = False
+    if args.no_memory:
+        overrides["memory_enabled"] = False
+    if args.no_provenance_labels:
+        overrides["provenance_labels"] = False
+    if args.poll_seconds is not None and args.poll_seconds <= 0:
+        parser.error("--poll must be greater than zero")
+    folder = os.path.abspath(args.folder)
     if not os.path.isdir(folder):
         print(f"Willow: that folder does not exist: {folder}")
         return 1
     os.makedirs(os.path.join(folder, WILLOW_DIR), exist_ok=True)
 
     cfg = load_config(folder, overrides)
+    live, _ = watcher_status(os.path.join(folder, WILLOW_DIR))
+    if live:
+        print("Willow: a watcher is already using this project. Stop it before starting another.")
+        return 1
     provider = resolve_provider(cfg)
 
     narrator = None
@@ -2245,7 +3044,8 @@ def cmd_watch(argv):
                   "no model backend is available") + ". Using plain wording.")
 
     speaker = Speaker(enabled=cfg["voice"], rate=cfg["voice_rate"],
-                      narrator=narrator, use_host=cfg.get("voice_host", True))
+                      narrator=narrator, use_host=cfg.get("voice_host", True),
+                      backend=cfg["speech_backend"], nvda_dll=cfg["nvda_dll"])
     viewer = Viewer(provider, timeout=cfg["view_timeout"])
 
     # Reading the project once takes a moment on a large one. Say so, because
@@ -2264,17 +3064,25 @@ def cmd_watch(argv):
         "press Enter for the current state",
         "diff      - read out what changed in the last chunk",
         "recap     - a summary of the whole session",
+        "briefing / briefing all - changes since the previous visit",
+        "history PATH - retained changes to one file (spaces are allowed)",
+        "evidence NUMBER - inspect a recorded fact and its hashes",
+        "away / back - save a break baseline / hear changes while away",
         "describe  - what does my app look like right now",
         "other     - describe a different window instead",
         "stop      - stop talking (also: shh)",
         "faster / slower  - change the speaking rate",
         "quiet / loud     - speak only the important things, or everything",
+        "pause / resume   - on-demand / automatic speech at pauses",
         "q         - quit",
     ]
 
     try:
         for line in sys.stdin:
-            cmd = line.strip().lower()
+            raw = line.strip()
+            cmd = raw.lower()
+            # An explicit request has priority over a routine speech backlog.
+            speaker.stop_talking()
             if cmd in ("q", "quit", "exit"):
                 break
             elif cmd in ("stop", "shh", "shut up", "quiet!", "x"):
@@ -2288,12 +3096,39 @@ def cmd_watch(argv):
                 willow.read_diff()
             elif cmd in ("recap", "summary", "session"):
                 willow.recap()
+            elif cmd in ("briefing", "since", "briefing all"):
+                willow.briefing(full=cmd == "briefing all")
+            elif cmd == "away":
+                willow.leave_for_break()
+            elif cmd == "back":
+                willow.return_from_break()
+            elif cmd.startswith("history "):
+                willow.file_history(raw[8:].strip().strip('"'))
+            elif cmd.startswith("evidence "):
+                try:
+                    willow.show_evidence(int(raw[9:].strip()))
+                except ValueError:
+                    willow.announce("Use evidence followed by a number from the briefing.", urgent=True)
+            elif cmd in ("pause", "on-demand"):
+                willow.cfg["speech_mode"] = "on-demand"
+                willow.announce("Automatic speech paused. I will still answer your requests.", urgent=True)
+            elif cmd in ("resume", "automatic"):
+                willow.cfg["speech_mode"] = "auto"
+                willow.announce("Automatic speech enabled at pauses. Type pause to return to on-demand speech.", urgent=True)
             elif cmd in ("faster", "f", "+"):
-                r = speaker.set_rate(speaker.rate + 1)
-                willow.announce(f"speaking rate {r}.", urgent=True)
+                bridge = getattr(speaker, "bridge", None)
+                if bridge and bridge.backend != "system":
+                    willow.announce("Change the speaking rate in your screen reader's settings.", urgent=True)
+                else:
+                    r = speaker.set_rate(speaker.rate + 1)
+                    willow.announce(f"speaking rate {r}.", urgent=True)
             elif cmd in ("slower", "-"):
-                r = speaker.set_rate(speaker.rate - 1)
-                willow.announce(f"speaking rate {r}.", urgent=True)
+                bridge = getattr(speaker, "bridge", None)
+                if bridge and bridge.backend != "system":
+                    willow.announce("Change the speaking rate in your screen reader's settings.", urgent=True)
+                else:
+                    r = speaker.set_rate(speaker.rate - 1)
+                    willow.announce(f"speaking rate {r}.", urgent=True)
             elif cmd in ("quiet", "less"):
                 willow.quiet = True
                 willow.announce("I'll only speak the important things now. "
@@ -2304,8 +3139,8 @@ def cmd_watch(argv):
             elif cmd in ("help", "h", "?"):
                 for h in HELP_LINES:
                     print("        " + h, flush=True)
-                speaker.say("You can ask for the state, diff, recap, describe, "
-                            "stop, faster, slower, quiet, loud, or q to quit.",
+                speaker.say("You can ask for state, diff, recap, briefing, history, evidence, away, back, describe, "
+                            "stop, pause, resume, faster, slower, quiet, loud, or q to quit.",
                             priority=P_URGENT)
             elif cmd in ("", "state", "status", "s"):
                 willow.state_summary()
@@ -2315,6 +3150,12 @@ def cmd_watch(argv):
         pass
     finally:
         willow.stop.set()
+        worker.join(timeout=max(5, cfg["poll_seconds"] + 4))
+        if not worker.is_alive():
+            willow._tick()
+            if willow.ep_touched or willow.ep_writes:
+                willow._close_episode([])
+            willow._save_memory(closed=True)
         speaker.stop_talking()
         speaker.close()
         try:
@@ -2369,6 +3210,7 @@ def cmd_run(argv):
                     del tail[:200]
             proc.wait()
             exit_code = proc.returncode
+            proc.stdout.close()
         else:
             exit_code = subprocess.run([exe] + argv[1:]).returncode
     except KeyboardInterrupt:
@@ -2408,15 +3250,29 @@ def cmd_hook(argv):
     unambiguous exit code, Willow reports only that a command RAN. It never
     converts an unknown into a verdict.
     """
-    event = argv[0] if argv else ""
+    parser = argparse.ArgumentParser(prog="willow hook")
+    parser.add_argument("event", nargs="?", default="")
+    parser.add_argument("--agent", choices=("claude", "codex"), default="claude")
+    args = parser.parse_args(argv)
+    event = args.event
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except (json.JSONDecodeError, ValueError):
         payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    if args.agent == "codex":
+        _codex_hook(event, payload)
+        # Codex Stop requires JSON stdout. Never return a continuation or an
+        # approval decision; Willow only observes and cannot authorize a tool.
+        print("{}")
+        return 0
 
     cwd = payload.get("cwd") or "."
     tool = payload.get("tool_name", "")
     tin = payload.get("tool_input") or {}
+    if not isinstance(tin, dict):
+        tin = {}
     tout = payload.get("tool_response") or payload.get("tool_result") or {}
     if not isinstance(tout, dict):
         tout = {"output": tout}
@@ -2442,8 +3298,17 @@ def cmd_hook(argv):
         if not path:
             return 0
         n = len(tin.get("edits") or []) if tool == "MultiEdit" else 1
-        deliver({"ts": time.time(), "type": "write", "path": path,
-                 "tool": tool, "count": max(1, n)}, cwd, warn=False)
+        full = path if os.path.isabs(path) else os.path.join(cwd, path)
+        digest = None
+        if not private_path(full):
+            try:
+                with open(full, "rb") as f:
+                    digest = hashlib.sha1(f.read()).hexdigest()
+            except OSError:
+                pass
+        deliver({"ts": time.time(), "type": "write", "path": os.path.abspath(full),
+                 "tool": tool, "count": max(1, n), "actor": "agent",
+                 "source": "Claude PostToolUse " + tool, "after_hash": digest}, cwd, warn=False)
         return 0
 
     if event == "PostToolUse" and tool == "Bash":
@@ -2452,7 +3317,7 @@ def cmd_hook(argv):
             return 0
         code = None
         for key in ("exit_code", "exitCode", "returncode", "code", "status"):
-            if isinstance(tout.get(key), int):
+            if type(tout.get(key)) is int:
                 code = tout[key]
                 break
         if code is None:
@@ -2472,6 +3337,180 @@ def cmd_hook(argv):
         return 0
 
     return 0
+
+
+def _codex_hook(event, payload):
+    cwd = os.path.abspath(payload.get("cwd") or ".")
+    target, _live = resolve_target_dir(cwd)
+    folder = os.path.dirname(os.path.abspath(target))
+    if event == "Stop":
+        deliver({"type": "notice", "ts": time.time(),
+                 "message": "Codex has finished its turn"}, cwd, warn=False)
+        return
+    if event == "PermissionRequest":
+        deliver({"type": "notice", "ts": time.time(),
+                 "message": "Codex is requesting your permission"}, cwd, warn=False)
+        return
+    tool = payload.get("tool_name")
+    tin = payload.get("tool_input")
+    tin = tin if isinstance(tin, dict) else {}
+    if tool == "Bash" and event == "PostToolUse":
+        # Arbitrary model-facing text is not a stable exit-code interface.
+        # Accept only an explicit integer field; `willow run` is authoritative.
+        response = payload.get("tool_response")
+        response = response if isinstance(response, dict) else {}
+        command = str(tin.get("command") or "the command")[:120]
+        code = next((response[k] for k in ("exit_code", "exitCode", "returncode")
+                     if type(response.get(k)) is int), None)
+        if code is not None:
+            deliver({"type": "check", "ts": time.time(), "exit_code": code,
+                     "command": command, "source": "Codex PostToolUse Bash"}, cwd, warn=False)
+        return
+    if tool != "apply_patch" or event not in ("PreToolUse", "PostToolUse"):
+        return
+    tool_id = payload.get("tool_use_id")
+    if not isinstance(tool_id, str) or not tool_id:
+        return  # Without a matched before/after pair, authorship stays unknown.
+    token = hashlib.sha256(tool_id.encode("utf-8")).hexdigest()
+    pending = os.path.join(target, "codex-pending-" + token + ".json")
+
+    def digest(path):
+        try:
+            if not os.path.lexists(path):
+                return True, None
+            with open(path, "rb") as f:
+                return True, hashlib.sha1(f.read()).hexdigest()
+        except OSError:
+            return False, None
+
+    def allowed(path):
+        try:
+            return (os.path.commonpath([os.path.realpath(path), os.path.realpath(folder)])
+                    == os.path.realpath(folder)
+                    and not is_ignored(os.path.relpath(path, folder)))
+        except ValueError:
+            return False
+
+    if event == "PreToolUse":
+        command = tin.get("command") or ""
+        if not isinstance(command, str):
+            return
+        paths = []
+        for match in re.finditer(r"(?m)^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$", command):
+            path = os.path.abspath(os.path.join(cwd, match.group(1).rstrip("\r")))
+            if path not in paths and allowed(path):
+                paths.append(path)
+        before = {}
+        for path in paths:
+            known, value = digest(path)
+            if known:
+                before[path] = value
+        if not before:
+            return
+        try:
+            os.makedirs(target, exist_ok=True)
+            with open(pending, "w", encoding="utf-8") as f:
+                json.dump({"at": time.time(), "folder": folder, "before": before}, f)
+        except OSError:
+            pass
+        return
+    try:
+        with open(pending, encoding="utf-8") as f:
+            saved = json.load(f)
+        os.remove(pending)
+        if (saved.get("folder") != folder or
+                not 0 <= time.time() - saved.get("at", 0) <= 600):
+            return
+        for path, old_hash in saved["before"].items():
+            if not allowed(path):
+                continue
+            known, new_hash = digest(path)
+            if known and old_hash != new_hash:
+                deliver({"type": "write", "ts": time.time(), "path": path,
+                         "count": 1, "actor": "agent", "after_hash": new_hash,
+                         "source": "Codex apply_patch before/after observation (concurrent edits possible)"},
+                        cwd, warn=False)
+    except (OSError, ValueError, TypeError, KeyError):
+        return
+
+
+def cmd_memory(command, argv):
+    """Read a briefing/history without advancing the saved visit baseline."""
+    parser = argparse.ArgumentParser(prog="willow " + command)
+    parser.add_argument("--folder", default=".")
+    if command in ("history", "record"):
+        parser.add_argument("path")
+    if command == "evidence":
+        parser.add_argument("number", type=int)
+    if command == "record":
+        parser.add_argument("--actor", choices=("user", "agent"), required=True)
+    if command == "briefing":
+        parser.add_argument("--all", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    folder = os.path.abspath(args.folder)
+    if not os.path.isdir(folder):
+        print("Willow: that project folder does not exist.")
+        return 1
+    if command == "record":
+        path = os.path.realpath(os.path.join(folder, args.path))
+        try:
+            if os.path.commonpath([path, os.path.realpath(folder)]) != os.path.realpath(folder):
+                raise ValueError("path is outside the project")
+            if private_path(path) or os.path.isdir(path):
+                raise ValueError("choose a non-private file")
+            digest = None
+            if os.path.lexists(path):
+                with open(path, "rb") as f:
+                    digest = hashlib.sha1(f.read()).hexdigest()
+            os.makedirs(os.path.join(folder, WILLOW_DIR), exist_ok=True)
+            deliver({"type": "write", "ts": time.time(), "path": path,
+                     "actor": args.actor, "source": "explicit declaration (not independently verified)",
+                     "after_hash": digest, "count": 1}, start=folder, warn=False)
+        except (OSError, ValueError) as e:
+            print("Willow: couldn't record provenance: " + str(e))
+            return 1
+        print("Willow: recorded your authorship declaration; it applies only to matching file content.")
+        return 0
+    if not os.path.exists(os.path.join(folder, WILLOW_DIR, "memory.sqlite3")):
+        print("Willow: no recorded project memory yet. Run willow watch first.")
+        return 1
+    try:
+        cfg = load_config(folder)
+        memory = ProjectMemory(folder, cfg)
+        if command == "history":
+            path = os.path.relpath(os.path.abspath(os.path.join(folder, args.path)), folder)
+            rows = memory.history(path)
+        elif command == "evidence":
+            fact = memory.evidence(args.number)
+            rows = [fact] if fact else []
+        else:
+            previous = memory.latest()
+            if not previous:
+                print("Willow: no recorded sessions yet.")
+                return 1
+            eyes = Eyes(folder, git_ignored_dirs(folder) | set(cfg["extra_ignore_dirs"]))
+            eyes.prime()
+            snapshot = memory_snapshot(eyes, previous["snapshot"])
+            rows = compare_snapshots(previous["snapshot"], snapshot)
+            print("Willow: comparison with the last checkpoint; this does not advance memory.")
+            if snapshot["uncertain"]:
+                print("Willow: some paths could not be read; comparison is incomplete.")
+        if args.json or command == "evidence":
+            print(json.dumps(rows, ensure_ascii=True, indent=2))
+        else:
+            limit = len(rows) if command != "briefing" or args.all else cfg["briefing_limit"]
+            for change in rows[:limit]:
+                suffix = f". Evidence {change['id']}." if "id" in change else "."
+                print("Willow: " + change_sentence(change) + suffix)
+            if len(rows) > limit:
+                print(f"Willow: {len(rows) - limit} more changes. Use --all for the complete comparison.")
+            if not rows:
+                print("Willow: no matching retained facts or verified net changes.")
+        return 0
+    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError) as e:
+        print("Willow: project memory is unavailable: " + str(e))
+        return 1
 
 
 def _gitignore_has(path, entry):
@@ -2508,6 +3547,27 @@ Everything else you do normally is fine.
 <!-- willow:end -->
 """
 
+AGENTS_MD_TEMPLATE = CLAUDE_MD_TEMPLATE.replace(
+    "Working notes for Claude Code", "Working notes for coding agents")
+
+
+def _write_agent_notes(folder, name, template, command):
+    path = os.path.join(folder, name)
+    block = template.format(command=command)
+    try:
+        with open(path, encoding="utf-8") as f:
+            existing = f.read()
+    except FileNotFoundError:
+        existing = ""
+    if "<!-- willow:start -->" in existing:
+        content = re.sub(r"<!-- willow:start -->.*?<!-- willow:end -->\n?",
+                         lambda _m: block, existing, flags=re.S)
+    else:
+        content = (existing.rstrip() + "\n\n" if existing.strip() else "") + block
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return f"updated {name}, with the right path already filled in"
+
 
 def self_command():
     """How to invoke Willow again from somewhere else, as short as is safe.
@@ -2529,9 +3589,14 @@ def self_command():
 
 def cmd_init(argv):
     """Set a project up, so nothing has to be edited by hand."""
-    install_hooks = "--no-hooks" not in argv
-    positional = [a for a in argv if not a.startswith("-")]
-    folder = os.path.abspath(positional[0] if positional else ".")
+    parser = argparse.ArgumentParser(prog="willow init")
+    parser.add_argument("folder", nargs="?", default=".")
+    parser.add_argument("--no-hooks", action="store_true")
+    parser.add_argument("--no-voice", action="store_true")
+    parser.add_argument("--agent", choices=("claude", "codex", "both"), default="both")
+    args = parser.parse_args(argv)
+    install_hooks = not args.no_hooks
+    folder = os.path.abspath(args.folder)
     if not os.path.isdir(folder):
         print(f"Willow: that folder does not exist: {folder}")
         return 1
@@ -2548,7 +3613,8 @@ def cmd_init(argv):
         with open(cfg_path, "w", encoding="utf-8") as f:
             json.dump({k: DEFAULTS[k] for k in
                        ("voice_rate", "verbosity", "provider", "text_model",
-                        "vision_model", "poll_seconds")}, f, indent=2)
+                        "vision_model", "poll_seconds", "speech_mode", "speech_backend",
+                        "nvda_dll", "briefing_limit", "memory_sessions", "memory_facts")}, f, indent=2)
         done.append(f"wrote settings you can change in {WILLOW_DIR}/config.json")
 
     # 2. .gitignore
@@ -2566,42 +3632,21 @@ def cmd_init(argv):
         except OSError:
             pass
 
-    # 3. CLAUDE.md, with the real path already filled in
-    block = CLAUDE_MD_TEMPLATE.format(command=command)
-    cm = os.path.join(folder, "CLAUDE.md")
-    existing = ""
-    try:
-        with open(cm, "r", encoding="utf-8") as f:
-            existing = f.read()
-    except OSError:
-        pass
-    if "<!-- willow:start -->" in existing:
-        # A lambda replacement, so backslashes in a Windows path are not read
-        # as regex escapes.
-        new = re.sub(r"<!-- willow:start -->.*?<!-- willow:end -->\n?",
-                     lambda _m: block, existing, flags=re.S)
-        verb = "updated"
-    elif existing.strip():
-        new = existing.rstrip() + "\n\n" + block
-        verb = "added the Willow section to"
-    else:
-        new = block
-        verb = "created"
-    try:
-        with open(cm, "w", encoding="utf-8") as f:
-            f.write(new)
-        done.append(f"{verb} CLAUDE.md, with the right path already filled in")
-    except OSError as e:
-        print(f"Willow: couldn't write CLAUDE.md ({e})")
-
-    # 4. Claude Code hooks - these fire from the harness, not the model, so
-    #    they work even when the agent forgets the CLAUDE.md rule.
-    if install_hooks:
+    # Instructions and hooks for both agent families. Existing sections survive.
+    agents = ("claude", "codex") if args.agent == "both" else (args.agent,)
+    for agent in agents:
+        name, template = (("CLAUDE.md", CLAUDE_MD_TEMPLATE) if agent == "claude"
+                          else ("AGENTS.md", AGENTS_MD_TEMPLATE))
         try:
-            done.append(_install_hooks(folder, command))
-        except Exception as e:
-            print(f"Willow: couldn't install Claude Code hooks ({e}). "
-                  "That's fine - the CLAUDE.md rule still works.")
+            done.append(_write_agent_notes(folder, name, template, command))
+        except OSError as e:
+            print(f"Willow: couldn't write {name} ({e})")
+        if install_hooks:
+            try:
+                done.append(_install_hooks(folder, command, agent=agent))
+            except Exception as e:
+                print(f"Willow: couldn't install {agent} hooks ({e}). "
+                      f"The {name} instruction still applies if it was written successfully.")
 
     print("Willow: this project is set up.")
     for d in done:
@@ -2612,28 +3657,35 @@ def cmd_init(argv):
     print("Then work with your AI agent in another window.")
     print("\nIf anything seems wrong, run:  " + command + " doctor")
 
-    speaker = Speaker(enabled=True, rate=load_config(folder)["voice_rate"])
+    cfg = load_config(folder)
+    speaker = Speaker(enabled=cfg["voice"] and not args.no_voice, rate=cfg["voice_rate"],
+                      backend=cfg["speech_backend"], nvda_dll=cfg["nvda_dll"])
     speaker.say("Willow is set up for this project. Run willow watch to start "
                 "listening.", priority=P_URGENT)
-    time.sleep(4)
+    if cfg["voice"] and not args.no_voice:
+        time.sleep(4)
     speaker.close()
     return 0
 
 
-def _hook_command(command, event):
-    return f"{command} hook {event}"
+def _hook_command(command, event, agent="claude"):
+    suffix = " --agent codex" if agent == "codex" else ""
+    return f"{command} hook {event}{suffix}"
 
 
-def _install_hooks(folder, command):
-    """Merge Willow's hooks into .claude/settings.json without clobbering."""
-    path = os.path.join(folder, ".claude", "settings.json")
+def _install_hooks(folder, command, agent="claude"):
+    """Merge project-local hooks; never change account/global configuration."""
+    path = os.path.join(folder, ".codex", "hooks.json") if agent == "codex" else os.path.join(folder, ".claude", "settings.json")
+    label = "Codex" if agent == "codex" else "Claude Code"
     os.makedirs(os.path.dirname(path), exist_ok=True)
     data = {}
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except FileNotFoundError:
         data = {}
+    if not isinstance(data, dict):
+        raise ValueError("hook configuration must be a JSON object")
     hooks = data.setdefault("hooks", {})
 
     wanted = [
@@ -2646,6 +3698,10 @@ def _install_hooks(folder, command):
         ("Notification", None),
         ("Stop", None),
     ]
+    if agent == "codex":
+        wanted = [("PreToolUse", "^apply_patch$"),
+                  ("PostToolUse", "Bash|^apply_patch$"),
+                  ("PermissionRequest", None), ("Stop", None)]
 
     def already_there(entries, cmd, matcher):
         # Compare the actual command strings, not their JSON encoding - a
@@ -2661,7 +3717,7 @@ def _install_hooks(folder, command):
 
     added = []
     for event, matcher in wanted:
-        cmd = _hook_command(command, event)
+        cmd = _hook_command(command, event, agent)
         entries = hooks.setdefault(event, [])
         if already_there(entries, cmd, matcher):
             continue
@@ -2672,17 +3728,24 @@ def _install_hooks(folder, command):
         added.append(event if not matcher else f"{event}:{matcher.split('|')[0]}")
 
     if not added:
-        return "Claude Code hooks were already installed"
+        return label + " hooks were already installed"
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+    if agent == "codex":
+        return ("installed Codex hooks. Open /hooks in Codex to review and trust them; "
+                "project-local configuration must also be trusted")
     return ("installed Claude Code hooks (" + ", ".join(added) + ") so you also "
             "hear when Claude is waiting for you")
 
 
 def cmd_doctor(argv):
     """Check everything, out loud - because every failure here is silence."""
-    folder = os.path.abspath(argv[0] if argv and not argv[0].startswith("-") else ".")
-    cfg = load_config(folder)
+    parser = argparse.ArgumentParser(prog="willow doctor")
+    parser.add_argument("folder", nargs="?", default=".")
+    parser.add_argument("--no-voice", action="store_true")
+    args = parser.parse_args(argv)
+    folder = os.path.abspath(args.folder)
+    cfg = load_config(folder, {"voice": False} if args.no_voice else None)
     lines = []
     problems = []
 
@@ -2701,8 +3764,19 @@ def cmd_doctor(argv):
                      "(change with: willow watch --rate 5)")
     else:
         lines.append("Voice: NOT AVAILABLE")
-        problems.append("no speech engine found. On Linux install one of "
-                        "speech-dispatcher (spd-say) or espeak")
+        if cfg["voice"]:
+            problems.append("no speech engine found. On Linux install one of "
+                            "speech-dispatcher (spd-say) or espeak")
+    bridge = ScreenReaderBridge(cfg["speech_backend"] if cfg["voice"] else "system", cfg["nvda_dll"])
+    if not cfg["voice"]:
+        lines.append("Voice output: disabled; text-only operation does not need a speech engine")
+    lines.append(f"Speech routing: {bridge.backend}; mode: {cfg['speech_mode']}")
+    if bridge.problem:
+        problems.append(bridge.problem)
+    lines.append("Screen-reader speech state: not monitored on all platforms. "
+                 "Use on-demand speech to control overlap.")
+    lines.append("Git: available" if shutil.which("git") else
+                 "Git: unavailable; filesystem memory still works, without revision context")
 
     # model backend
     provider = resolve_provider(cfg)
@@ -2732,34 +3806,44 @@ def cmd_doctor(argv):
         live, watched = watcher_status(wd)
         lines.append("  a Willow IS watching this folder right now" if live
                      else "  no Willow is watching this folder right now")
+        memory_path = os.path.join(wd, "memory.sqlite3")
+        if os.path.exists(memory_path):
+            try:
+                memory = ProjectMemory(folder, cfg)
+                with memory.db() as db:
+                    okay = db.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+                if not okay:
+                    raise ValueError("integrity check failed")
+                lines.append("  project memory: readable; recent sessions and file history are local")
+            except (OSError, sqlite3.Error, ValueError) as e:
+                problems.append("project memory is unavailable: " + str(e))
+        else:
+            lines.append("  project memory: a baseline will be saved on the first watch")
     else:
         lines.append("  not set up yet - run: willow init")
         problems.append("this project has not been set up. Run willow init")
 
-    cm = os.path.join(folder, "CLAUDE.md")
-    try:
-        with open(cm, "r", encoding="utf-8") as f:
-            content = f.read()
-        if "willow" in content.lower() and "<PATH-TO>" not in content:
-            lines.append("  CLAUDE.md tells the agent to use Willow: yes")
-        elif "<PATH-TO>" in content:
-            lines.append("  CLAUDE.md still has a placeholder path")
-            problems.append("CLAUDE.md has an unfilled <PATH-TO> placeholder. "
-                            "Run willow init to fix it")
-        else:
-            lines.append("  CLAUDE.md does not mention Willow")
-            problems.append("CLAUDE.md has no Willow rule. Run willow init")
-    except OSError:
-        lines.append("  no CLAUDE.md")
-        problems.append("there is no CLAUDE.md. Run willow init")
-
-    hooks_path = os.path.join(folder, ".claude", "settings.json")
-    try:
-        with open(hooks_path, "r", encoding="utf-8") as f:
-            lines.append("  Claude Code hooks installed: "
-                         + ("yes" if "willow" in f.read().lower() else "no"))
-    except OSError:
-        lines.append("  Claude Code hooks installed: no")
+    instruction_ready = False
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        try:
+            with open(os.path.join(folder, name), encoding="utf-8") as f:
+                content = f.read()
+            ready = "willow" in content.lower() and "<PATH-TO>" not in content
+            lines.append(f"  {name} tells the agent to use Willow: " + ("yes" if ready else "no"))
+            instruction_ready = instruction_ready or ready
+        except OSError:
+            lines.append("  no " + name)
+    if not instruction_ready:
+        problems.append("No usable Willow agent instructions. Run willow init")
+    for label, directory, filename in (("Claude Code", ".claude", "settings.json"),
+                                       ("Codex", ".codex", "hooks.json")):
+        try:
+            with open(os.path.join(folder, directory, filename), encoding="utf-8") as f:
+                present = "willow" in f.read().lower()
+        except OSError:
+            present = False
+        lines.append(f"  {label} hooks installed: " + ("yes" if present else "no"))
+    lines.append("  Codex hook trust is reviewed inside Codex using /hooks; doctor cannot verify it")
 
     if not _gitignore_has(os.path.join(folder, ".gitignore"), WILLOW_DIR):
         lines.append("  .willow/ is NOT in .gitignore")
@@ -2773,17 +3857,19 @@ def cmd_doctor(argv):
     else:
         print("\nEverything looks ready.")
 
-    speaker = Speaker(enabled=cfg["voice"], rate=cfg["voice_rate"])
+    speaker = Speaker(enabled=cfg["voice"], rate=cfg["voice_rate"],
+                      backend=cfg["speech_backend"], nvda_dll=cfg["nvda_dll"])
     spoken = "Willow check. " + (
         "Everything looks ready. " if not problems else
         f"{len(problems)} thing{'s' if len(problems) != 1 else ''} to fix. "
         + " Also, ".join(problems) + ". ")
     spoken += ("Natural narration and describe are available."
                if provider.available() else
-               "Facts and speech work; natural narration is not set up, which is optional.")
+               "Natural narration is not set up, which is optional. This is the speech test.")
     speaker.say(spoken, priority=P_URGENT)
-    print("\n(speaking the result...)")
-    time.sleep(min(25, 3 + len(spoken) / 14))
+    if cfg["voice"]:
+        print("\n(speaking the result; check that you can hear it with your screen reader...)")
+        time.sleep(min(25, 3 + len(spoken) / 14))
     speaker.close()
     return 1 if problems else 0
 
@@ -2791,26 +3877,39 @@ def cmd_doctor(argv):
 HELP = f"""Willow {__version__} - a companion narrator for blind builders.
 
   willow init [folder]      Set a project up. Do this once, per project.
+                            --agent claude|codex|both (default both).
   willow watch [folder]     Start watching (leave this window open).
   willow run <command>      Run a build/test command through Willow so it can
                             report the real pass/fail, e.g. willow run npm test
   willow doctor [folder]    Check everything works, and say the result out loud.
+  willow briefing          Compare now with the last checkpoint, without advancing it.
+  willow history PATH      Read retained file history. Add --folder DIR as needed.
+  willow evidence NUMBER   Inspect a fact, its source and content hashes.
+  willow record --actor user|agent PATH  Record a declaration for these exact bytes.
 
 Options for `watch`:
   --narrate                 Say the same verified facts in a more natural voice.
-                            Anything the model says that the facts don't support
-                            is thrown away.
+                            Legacy syntactic checks reject new numbers, paths
+                            and verdicts. Memory briefings use fixed wording.
   --provider NAME           auto | anthropic | openai | ollama | openai-compat
                             `ollama` runs a model on THIS computer: no key, no
                             internet, and nothing about your project leaves it.
                             Suggested model: ollama pull gemma4
   --model NAME              Which model to use.
+  --vision-model NAME       Model for optional screen descriptions.
+  --openai-api NAME         responses (default) | chat-completions.
   --base-url URL            For any OpenAI-compatible server.
   --rate N                  Speaking rate, -10 (slow) to 10 (fast). Default 3.
   --quiet                   Speak only the important things; print everything.
   --no-voice                Text only.
+  --speech auto|on-demand   Default: on-demand. Auto speaks at natural pauses.
+  --backend auto|system|nvda|jaws  Windows screen-reader or system speech.
+  --nvda-dll PATH           Architecture-matched NVDA controller client DLL.
+  --no-briefing             Omit the startup briefing (study baseline condition).
+  --no-memory               Do not read or retain project memory in this session.
 
-While watching, type: (Enter) state, diff, recap, describe, other, stop,
+While watching, type: (Enter) state, diff, recap, briefing, briefing all,
+history PATH, evidence NUMBER, away, back, describe, other, stop, pause, resume,
 faster, slower, quiet, loud, help, q.
 
 Settings live in <project>/.willow/config.json and ~/.willow/config.json.
@@ -2836,6 +3935,8 @@ def main(argv=None):
         return cmd_doctor(rest)
     if cmd == "hook":
         return cmd_hook(rest)
+    if cmd in ("briefing", "history", "evidence", "record"):
+        return cmd_memory(cmd, rest)
     print(HELP)
     return 1
 

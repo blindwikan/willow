@@ -1,0 +1,3 @@
+include AGENTS.md CLAUDE.md RULES.md EXAMPLE-output.txt
+include evaluate_memory.py test_*.py
+recursive-include docs *.md

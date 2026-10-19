@@ -11,6 +11,15 @@ whether the agent quietly undid its own work.
 Every update is a **fact you could check yourself**. Willow never guesses. If it
 cannot verify something, it says so, or says nothing — it never fills the gap.
 
+Version 2.1 adds persistent project memory, return briefings, per-file history,
+recorded authorship, and speech on demand. The implementation is inspired by
+[StateScribe](https://arxiv.org/abs/2604.23749), adapted to code rather than scenes.
+See the [accessible setup guide](docs/SETUP.md), [study protocol](docs/STUDY.md),
+and [implementation and validation notes](docs/IMPLEMENTATION.md).
+
+**Installing this checkout:** run `python -m pip install .` from this folder.
+The package index may have an earlier version until 2.1 is released.
+
 ---
 
 ## Setting up (about a minute)
@@ -30,7 +39,11 @@ willow init
 
 That one command does everything that used to be manual: it writes the rule that
 tells your AI agent to run tests through Willow (with the correct path already
-filled in), adds `.willow/` to your `.gitignore`, and installs Claude Code hooks.
+filled in), adds `.willow/` to your `.gitignore`, and installs project-local
+Claude Code and Codex hooks. Use `--agent codex` or `--agent claude` to choose
+one integration; the default is `both`. Existing instructions are preserved.
+Codex reads `AGENTS.md`; Claude Code reads `CLAUDE.md`. Review and trust Codex's
+new hook definitions using `/hooks` before relying on hook announcements.
 
 The hooks are worth having. They come from the harness rather than from the
 model, so they work even when the agent forgets the rule — and they let Willow
@@ -61,9 +74,15 @@ ask "are you working?" and hear a real answer matters.
 willow watch
 ```
 
-Willow says *"starting up"*, then *"watching … I'll tell you what the agent
-changes."* **Wait for that second line** — anything that changes before it counts
+Willow says *"starting up"*, then *"watching … I'll record what changes."*
+**Wait for that second line** — anything that changes before it counts
 as how the project already was. Leave this window open.
+
+Speech is **on demand by default**, apart from the startup instructions and
+return briefing. Automatic changes remain readable as text. Use
+`willow watch --speech auto` to hear changes at episode boundaries. `pause`
+returns to on-demand speech; `resume` enables automatic speech. This does not
+detect when VoiceOver, Orca, NVDA or JAWS is reading; you control the timing.
 
 ### Window 2 — you and your AI agent
 
@@ -93,6 +112,11 @@ Type any of these and press Enter:
 | *(just Enter)* | The state right now — "3 new files, 1 changed since we started" |
 | `diff` | Reads out **what** actually changed in the last chunk, line by line |
 | `recap` | A summary of the whole session |
+| `briefing` / `briefing all` | Changes since your preceding visit, with evidence numbers |
+| `away` / `back` | Save a break baseline, then hear what changed while away |
+| `history PATH` | Retained history for a file, including inferred moves |
+| `evidence NUMBER` | The recorded source, category, authorship and endpoint hashes |
+| `pause` / `resume` | On-demand / automatic speech at natural pauses |
 | `describe` | What your app **looks** like right now |
 | `other` | Describe a different window — if `describe` grabbed the wrong one |
 | `stop` | Stop talking right now, and drop the backlog (also `shh`) |
@@ -125,6 +149,34 @@ announcements behind with no way to skip is worse than missing one.
 When several files change at once, the spoken version is collapsed into one
 sentence, but the text prints **one file per line** so you can arrow through it.
 
+New announcements label each file as `author unknown`, `agent recorded`,
+`user recorded`, or `mixed provenance`. A matching Claude write hook records
+agent activity; other agents and people can declare a change using
+`willow record --actor user PATH` or `willow record --actor agent PATH`.
+Declarations are labelled as such in the evidence. Git author names are never
+treated as proof that a human or AI made a change. A matching hook also does
+not prove exclusive authorship when editing concurrently.
+
+Reopening `watch` compares against the last saved checkpoint. The short briefing
+speaks at most five facts and offers the rest on request. Removed files and
+packages come first, followed by settings and moves. Each fact has an evidence
+number. Exact-content move matches are explicitly **inferred**, since deleting
+a file and creating an identical copy is also possible. Ambiguous matches are
+reported as separate additions/removals.
+
+The memory stores recent session snapshots and a longer per-file fact history
+in `.willow/memory.sqlite3`. It stores hashes and setting fingerprints, not source
+text or setting values. JSON settings, npm manifests, Python project metadata
+and requirements files have structured change tracking; other formats have
+file-level tracking. Private credential filenames are excluded. Unknown formats,
+unreadable paths and unobserved changes remain uncertain.
+
+Outside the watching window, `willow briefing`, `willow history PATH`, and
+`willow evidence NUMBER` print readable facts. Add `--folder DIR` for another
+project and `--json` for structured output. The standalone briefing compares now
+against the last checkpoint without advancing it; it does not create evidence
+numbers. Inside the watcher, `briefing` repeats its saved return briefing.
+
 ---
 
 ## Optional: a more natural voice
@@ -146,6 +198,10 @@ anything else is thrown away and the plain wording is used instead. So the
 promise that narration cannot invent a test result doesn't rest on the model
 behaving — it's enforced, and it holds for small local models too.
 
+Those legacy checks are syntactic safeguards, not a proof of arbitrary prose's
+meaning. The new briefings, history, evidence and authorship-labelled changes
+always use deterministic wording; they are never rewritten by a model.
+
 The exact facts always go to the log as the citable ground truth, with the
 spoken version beside them.
 
@@ -156,6 +212,14 @@ spoken version beside them.
 Willow works with **Anthropic**, **OpenAI**, or a **local model through Ollama** —
 and with anything else that speaks the OpenAI API (LM Studio, vLLM, llama.cpp,
 OpenRouter…).
+
+Direct OpenAI requests now use the **Responses API** for text and images.
+Set `OPENAI_API_KEY` or the private `~/.willow/openai_key` file, then run
+`willow watch --narrate --provider openai`. Choose models with `--model NAME`
+and `--vision-model NAME`. To keep a legacy deployment, use
+`--openai-api chat-completions`. Compatible local servers keep their existing
+Chat Completions protocol. No OpenAI Python SDK is required. See the
+[OpenAI and Codex guide](docs/OPENAI.md) for setup and evidence limitations.
 
 **A local model is the recommended choice.** Narration sends your file paths
 somewhere, and `describe` sends a picture of your screen. With Ollama, neither
@@ -241,10 +305,20 @@ Everything adjustable lives in `.willow/config.json` in your project (and
 }
 ```
 
-`voice_rate` runs from -10 to 10. Command-line flags beat the config file, which
-beats environment variables (`WILLOW_PROVIDER`, `WILLOW_BASE_URL`,
-`WILLOW_TEXT_MODEL`, `WILLOW_VISION_MODEL`, `WILLOW_VOICE_RATE`), which beat the
-defaults.
+Additional defaults are `speech_mode: "on-demand"`, `speech_backend: "auto"`,
+`briefing_limit: 5`, `repeat_seconds: 15`, `memory_sessions: 30`, and
+`memory_facts: 10000`. `nvda_dll` optionally selects a user-supplied NVDA client
+DLL. Windows also supports `--backend jaws`; macOS uses `say`, and Linux uses
+Speech Dispatcher or eSpeak. See [platform setup](docs/SETUP.md) for details.
+`--no-memory` disables the session ledger without deleting existing records.
+Retention limits remove old records logically; they are not a secure-erasure
+mechanism. Logs and inbox files have separate retention: `willow.log` rotates,
+while JSONL events and inbox files grow until you remove them with Willow stopped.
+
+`voice_rate` runs from -10 to 10. Command-line flags beat environment variables
+(`WILLOW_PROVIDER`, `WILLOW_BASE_URL`,
+`WILLOW_TEXT_MODEL`, `WILLOW_VISION_MODEL`, `WILLOW_VOICE_RATE`), which beat
+project config, user config, and defaults, in that order.
 
 ---
 
@@ -282,3 +356,13 @@ willow run python -m unittest discover
 The suite pins every rule in [RULES.md](RULES.md) to the exact sentence it
 produces, and carries a regression test for every defect ever found — named for
 what Willow used to say wrongly.
+
+For the repeatable synthetic technical evaluation:
+
+```bash
+python willow.py run python evaluate_memory.py --output .willow/evaluation.json
+```
+
+This reports precision, recall, F1, repetition, latency and storage on explicit
+fixtures plus 110 revisits. It is not a user study. Cross-platform CI is
+configured; real NVDA/JAWS/VoiceOver/Orca acceptance remains a study prerequisite.
