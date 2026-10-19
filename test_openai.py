@@ -121,7 +121,9 @@ class TestOpenAIResponses(unittest.TestCase):
         calls = []
         def post(url, headers, payload, timeout):
             calls.append(payload)
-            raise urllib.error.HTTPError(url, 400, "bad parameter", {}, None)
+            # A real HTTP error owns a response stream. Python 3.8/3.9 cannot
+            # close the incomplete fp=None fixture used by the original test.
+            raise urllib.error.HTTPError(url, 400, "bad parameter", {}, io.BytesIO(b"{}"))
         with patch.object(W, "_post_json", side_effect=post):
             self.assertIsNone(W.OpenAICompatProvider(api_key="test").text("s", "f", 100, 5))
         self.assertEqual(len(calls), 2)
