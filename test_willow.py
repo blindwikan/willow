@@ -76,6 +76,9 @@ class WillowCase(unittest.TestCase):
     def start(self, **cfg_overrides):
         cfg = dict(W.DEFAULTS)
         cfg.update({"quiet_seconds": 0.01, "poll_seconds": 0.01})
+        # The original rulebook's wording remains available as a study baseline.
+        # New provenance labels and their evidence are pinned in test_memory.py.
+        cfg["provenance_labels"] = False
         cfg.update(cfg_overrides)
         self.w = W.Willow(self.dir, self.speaker, cfg)
         self.said = []
@@ -973,6 +976,7 @@ class TestLocalModelOverHTTP(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown()
+        cls.srv.server_close()
 
     def setUp(self):
         type(self).received = []

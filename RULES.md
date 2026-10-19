@@ -226,3 +226,159 @@ In `.willow/config.json` (see the README), not in the source:
 - `stuck_threshold = 3` — failing episodes before "stuck" is announced.
 - `narrate_timeout = 1.5` — the hard budget for a natural rewording.
 - `voice_rate = 3` — speaking rate, -10 to 10.
+
+## Revisit memory and provenance (2.1)
+
+The examples earlier on this page show the legacy file wording. By default,
+2.1 appends an authorship label to each live file phrase: `[author unknown]`,
+`[agent recorded]`, `[user recorded]`, or `[mixed provenance]`. Set
+`provenance_labels` to false only for the explicit legacy study condition.
+New memory descriptions always use fixed wording, even with narration enabled.
+The default stuck summary says `PATH changed in N recorded attempts that each
+ended with 'COMMAND' failing`; it does not assign unknown edits to the agent.
+
+| Recorded condition | Wording / behavior |
+|---|---|
+| No previous session | `This is the first recorded session. I saved a baseline for your next visit.` |
+| Reopen without changes | `Since your last checkpoint, DATE: no verified net file changes.` |
+| Unclean preceding exit | Append `The previous session ended without a final checkpoint.` |
+| Unreadable path | Keep its last known state; append `Some paths could not be read; I have not treated them as deleted.` |
+| File appears / disappears / changes | `PATH appeared`, `PATH removed`, or `PATH modified`, followed by authorship |
+| Unique identical-content move | `OLD moved to NEW (identical content; inferred move)`, followed by authorship |
+| Ambiguous identical content | Separate additions/removals; no move verdict |
+| Structured setting change | `setting FIELD modified in PATH`, followed by authorship |
+| Package appears / disappears | `package FIELD appeared in PATH` or `package FIELD removed in PATH`, followed by authorship |
+| Matching recorded agent content | `agent (recorded)`; source is inspectable |
+| Matching human declaration | `you (recorded)`; evidence says it is a declaration |
+| Missing or stale provenance | `author unknown` |
+| Conflicting matching provenance | `mixed provenance` |
+| Evidence | Append `Evidence NUMBER.`; `evidence NUMBER` prints the source and endpoint hashes |
+
+Recent snapshots and per-file history persist in `.willow/memory.sqlite3`.
+Session/fact retention is bounded independently. A return briefing reports net
+changes after the preceding checkpoint, not every intermediate event. Corrupt
+memory produces an explicit unverifiable-briefing message, never an empty
+baseline pretending no changes occurred. A standalone `willow briefing` does
+not advance memory or assign new evidence IDs.
+
+`away` saves an interruption baseline and selects on-demand speech; `back`
+compares against it and restores the preceding speech mode. A second `away`
+does not reset the baseline. An aggregate break fact reuses recorded authorship
+only when its before and after hashes match a retained fact after that baseline.
+
+## Speech policy (2.1)
+
+- Default `speech_mode` is `on-demand`. Startup instructions and the return
+  briefing are spoken; automatic change episodes are text only. Requests are
+  spoken unless voice is disabled. `--speech auto` or `resume` enables speech
+  at episode boundaries; `pause` returns to on-demand mode.
+- A tick that observes a new write cannot also establish a natural quiet
+  period. A subsequent quiet tick or an actual command result ends the episode.
+- Within an automatic episode, failures precede routine file changes. Existing
+  priority queues retain urgent items. A typed request clears the old speech
+  backlog before it is answered.
+- At most `briefing_limit` details (default 5) are spoken in one summary. All
+  details are printed. Briefings offer `briefing all` for expansion.
+- Identical routine automatic speech is filtered within `repeat_seconds`
+  (default 15). Explicit requests and distinct checkpoints with urgent results
+  are not repetition-filtered. Quiet mode suppresses routine automatic speech.
+- `--no-voice` uses text throughout, including startup and doctor. Unsupported
+  Windows screen-reader bridges report their system-speech fallback explicitly.
+- macOS uses `say`. Linux tries `spd-say`, then `espeak` if missing or unsuccessful.
+  NVDA uses a user-provided controller DLL; JAWS uses its installed active COM
+  interface. These bridges do not establish universal screen-reader idle timing.
+
+`test_memory.py` covers new categories, recovery, evidence, provenance,
+break/reopen behavior and speech policy. `evaluate_memory.py` compares outputs
+to an independently specified synthetic oracle; it does not establish usability.
+
+## OpenAI and Codex
+
+Direct OpenAI calls use Responses by default. Compatible servers and the
+explicit `openai_api: "chat-completions"` option retain Chat Completions.
+Refused, incomplete, failed or malformed Responses output is not narrated.
+Memory facts and provenance are never rewritten by a model.
+
+Codex setup preserves AGENTS.md and merges project-local hooks. Codex requires
+the user to review/trust hooks in its own interface. Willow never approves
+tools or requests continuation. A matched before/after patch observation can
+record agent activity; missing/stale observations and uninstrumented shell
+edits retain unknown authorship. `Stop` says `Codex has finished its turn`;
+`PermissionRequest` says `Codex is requesting your permission`. Neither implies
+a test verdict. Only an explicit integer exit code or `willow run` establishes
+pass/fail. These cases are pinned in `test_openai.py`.
+
+## Focus, review and handover
+
+`focus on` or `watch --focus` buffers **all automatic watcher text and speech**,
+including failures and warnings. Explicit requests still answer immediately.
+The acknowledgement is `Focus mode on. Automatic text and speech are buffered.
+Type review when ready.` Startup instructions explain focus mode; automatic
+startup briefings, notes and results go into the buffer. `pause` controls only
+speech and is a separate choice. The worker keeps observing/checkpointing.
+
+`focus off` says `Focus mode off. New automatic updates can appear; buffered
+updates remain available with review.` It never dumps a backlog. The default
+buffer holds 200 updates, is limited by `focus_buffer_limit`, and is discarded
+on exit. Overflow is reported at review. Logs rotate and memory has its own
+retention limits; focus does not change them. `review clear` says `Buffered
+review cleared. Recorded facts and logs are retained.`
+
+`review`, `browse`, `history PATH` and `briefing` populate a keyboard navigator.
+`review` freezes a snapshot of buffered updates, `browse` loads up to 100 newest
+facts, and file history loads up to 20. The browser says `TITLE, item N of M:
+TEXT`. `next` and `previous` move once; `repeat` repeats the current item;
+`expand` reads its details or evidence. Boundaries say `Already at the first
+item.` / `Already at the last item.` and do not wrap. An empty list replaces
+any earlier list. `next` no longer selects another visual window; use `other`.
+
+Notes have only working, blockers and next fields, at most 4000 characters
+each. They live in `.willow/handover.json` and are displayed as `User note
+(not verified). LABEL: TEXT`. They stay separate from verified change facts,
+model narration, announcement logs and study-export text. Control characters
+are escaped. Corrupt notes are preserved when a save fails. Clearing notes
+does not clear memory. Startup returns saved notes, buffered when in focus.
+The standalone `handover` command works without a watcher.
+
+## Observed build/test version
+
+`willow run` observes watched-file hashes and Git context at both command
+endpoints. The exit code is still the command's real outcome, independent of
+freshness. Retain up to 20 result records in memory; `checks` requests the
+latest and `checks all` requests all retained results. Startup and state also
+report the latest result. Failure snippets are not copied into the result
+table; local command arguments can still contain sensitive text.
+
+| Observation | Freshness wording |
+|---|---|
+| Same scope, known endpoints and current matching signature | `matches observed project state at both command endpoints; test coverage not established` |
+| Current signature differs from the recorded endpoint | `observed project state differs from this check` |
+| Before/after signatures differ | `observed files changed during the command; tested version uncertain` |
+| Missing endpoint observations | `tested version not recorded` |
+| Unreadable observations, invalid signatures or another project scope | `tested version could not be verified` |
+
+These are bounded observations using the regular file/ignore/symlink policy.
+They cannot establish tested coverage, observe ignored/external dependencies,
+or detect edits that were made and reverted between snapshots. A successful
+command never implies the current project has been fully tested.
+
+## Opt-in study ledger
+
+Recording is off by default; ordinary use and `study status` create no study
+database. `study start CODE` explicitly starts a local recording with a
+participant code. Recording persists across watcher restarts until `study
+stop`; startup announces active recording. A second start cannot silently
+replace an active session. This is a recording control, not consent or ethics
+approval. Metrics failures do not stop project observation.
+
+`.willow/study.sqlite3` accepts only allowed event shapes: canonical actions,
+restricted phase labels, counts, relative timings and user-reported collisions.
+`study mark` accepts setup, practice, task, task-CODE, break, return, interview
+or complete. `study collision` records a user report, not detected overlap.
+Speech metrics count requests, not audible delivery. No accuracy, usability
+or speech-idle verdict is inferred. Export revalidates the allowed shapes and
+does not contain source, paths, hashes, command arguments, note text,
+announcement text or absolute timestamps. The participant code and generated
+session ID remain. Repeat/stop request counts and phase durations are derived
+only from recorded actions. Recording stops independently of speech `stop`.
+Nothing is uploaded. `test_support.py` pins these support behaviors.

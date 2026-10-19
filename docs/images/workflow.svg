@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="480" viewBox="0 0 1200 480" role="img" aria-labelledby="title description">
+  <title id="title">Willow turns observed project activity into a review you control</title>
+  <desc id="description">You or an AI agent edit the project. Willow observes file snapshots and real exit codes from wrapped commands, then keeps local session and file history. Authorship stays recorded, unknown or mixed according to the evidence. Review uses keyboard commands and text, with optional requested speech. This core workflow needs no model.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M 1 1 L 8 5 L 1 9" fill="none" stroke="#17675f" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></marker>
+  </defs>
+  <rect width="1200" height="480" rx="20" fill="#f3f6f5"/>
+  <g font-family="Arial, Helvetica, sans-serif" fill="#172c39">
+    <text x="40" y="50" font-size="30" font-weight="700">Real changes. A review you control.</text>
+    <text x="40" y="83" font-size="20" fill="#3f5360">Willow follows the evidence, then lets you choose when and how to hear it.</text>
+
+    <g stroke="#17675f" stroke-width="2" fill="none" marker-end="url(#arrow)">
+      <path d="M 292 241 H 318"/>
+      <path d="M 574 241 H 600"/>
+      <path d="M 856 241 H 882"/>
+    </g>
+
+    <rect x="40" y="119" width="252" height="258" rx="14" fill="#ffffff" stroke="#a8beb8"/>
+    <rect x="40" y="119" width="252" height="7" rx="3" fill="#17675f"/>
+    <text x="60" y="159" font-size="18" font-weight="700" fill="#17675f">01 · WORK</text>
+    <text x="60" y="198" font-size="25" font-weight="700">Edit the project</text>
+    <text x="60" y="239" font-size="20">You or an AI agent</text>
+    <text x="60" y="267" font-size="20">create, change, move</text>
+    <text x="60" y="295" font-size="20">or remove files.</text>
+    <path d="M 60 316 H 272" stroke="#d5dfdb"/>
+    <text x="60" y="348" font-size="18" fill="#3f5360">No special editor required</text>
+
+    <rect x="322" y="119" width="252" height="258" rx="14" fill="#ffffff" stroke="#a8beb8"/>
+    <rect x="322" y="119" width="252" height="7" rx="3" fill="#17675f"/>
+    <text x="342" y="159" font-size="18" font-weight="700" fill="#17675f">02 · OBSERVE</text>
+    <text x="342" y="198" font-size="25" font-weight="700">Capture evidence</text>
+    <text x="342" y="239" font-size="20">File snapshots</text>
+    <text x="342" y="275" font-size="20">Real exit codes from</text>
+    <text x="342" y="303" font-size="20">wrapped commands</text>
+    <path d="M 342 316 H 554" stroke="#d5dfdb"/>
+    <text x="342" y="348" font-size="18" fill="#3f5360">Not an agent's self-report</text>
+
+    <rect x="604" y="119" width="252" height="258" rx="14" fill="#ffffff" stroke="#a8beb8"/>
+    <rect x="604" y="119" width="252" height="7" rx="3" fill="#17675f"/>
+    <text x="624" y="159" font-size="18" font-weight="700" fill="#17675f">03 · REMEMBER</text>
+    <text x="624" y="198" font-size="25" font-weight="700">Keep local facts</text>
+    <text x="624" y="239" font-size="20">Recent sessions</text>
+    <text x="624" y="267" font-size="20">and per-file history</text>
+    <text x="624" y="307" font-size="18" font-weight="700">Authorship stays explicit:</text>
+    <text x="624" y="337" font-size="18">recorded, unknown</text>
+    <text x="624" y="363" font-size="18">or mixed</text>
+
+    <rect x="886" y="119" width="274" height="258" rx="14" fill="#e7f1ee" stroke="#74a89d"/>
+    <rect x="886" y="119" width="274" height="7" rx="3" fill="#17675f"/>
+    <text x="906" y="159" font-size="18" font-weight="700" fill="#17675f">04 · REVIEW</text>
+    <text x="906" y="198" font-size="25" font-weight="700">Choose the detail</text>
+    <text x="906" y="239" font-size="20">Keyboard commands</text>
+    <text x="906" y="267" font-size="20">and readable text</text>
+    <text x="906" y="307" font-size="20">Optional speech</text>
+    <text x="906" y="335" font-size="20">when you ask for it</text>
+
+    <rect x="40" y="401" width="1120" height="48" rx="10" fill="#dce9e5"/>
+    <text x="60" y="432" font-size="20" font-weight="700">No model required.</text>
+    <text x="265" y="432" font-size="20">Optional narration rewords established facts; it does not decide them.</text>
+  </g>
+</svg>

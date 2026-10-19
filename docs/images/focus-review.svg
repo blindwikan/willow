@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="650" viewBox="0 0 1200 650" role="img" aria-labelledby="title description">
+  <title id="title">Focus now, review changes when ready</title>
+  <desc id="description">Illustrative Willow terminal interaction, not a screenshot. Focus on buffers automatic text and speech while file observation and fact recording continue. Review loads buffered updates. Next, previous, repeat and expand let you navigate them. Focus off allows new automatic updates without dumping the backlog. The bounded review buffer is temporary; persistent fact history is separate.</desc>
+  <rect width="1200" height="650" rx="20" fill="#f3f6f5"/>
+  <g font-family="Arial, Helvetica, sans-serif" fill="#172c39">
+    <text x="40" y="50" font-size="30" font-weight="700">Focus now. Catch up when you're ready.</text>
+    <text x="40" y="83" font-size="20" fill="#3f5360">Illustrative interaction · not a screenshot · output shortened for clarity</text>
+
+    <rect x="40" y="115" width="732" height="492" rx="14" fill="#142d3a"/>
+    <path d="M 40 163 H 772" stroke="#48606d"/>
+    <text x="64" y="146" font-size="18" font-weight="700" fill="#d5e4e8">WILLOW · WATCHER COMMANDS</text>
+
+    <g font-family="Consolas, 'Liberation Mono', monospace" font-size="20">
+      <text x="64" y="202" fill="#94e3ce" font-weight="700">&gt; focus on</text>
+      <text x="64" y="234" fill="#edf4f6">Automatic text and speech are buffered.</text>
+
+      <text x="64" y="290" fill="#94e3ce" font-weight="700">&gt; review</text>
+      <text x="64" y="322" fill="#edf4f6">Buffered updates, item 1 of 3:</text>
+      <text x="64" y="352" fill="#edf4f6">edited app.py ...</text>
+
+      <text x="64" y="406" fill="#94e3ce" font-weight="700">&gt; next / previous / repeat / expand</text>
+      <text x="64" y="438" fill="#edf4f6">Move, repeat, or inspect the current item.</text>
+
+      <text x="64" y="492" fill="#94e3ce" font-weight="700">&gt; focus off</text>
+      <text x="64" y="524" fill="#edf4f6">New automatic updates can appear.</text>
+      <text x="64" y="554" fill="#edf4f6">Earlier updates remain available in review.</text>
+    </g>
+
+    <rect x="798" y="115" width="362" height="201" rx="14" fill="#e7f1ee" stroke="#88b2a7"/>
+    <text x="820" y="153" font-size="23" font-weight="700">While focus is on</text>
+    <text x="820" y="193" font-size="20">Watching and fact recording</text>
+    <text x="820" y="221" font-size="20">continue.</text>
+    <text x="820" y="265" font-size="20">Explicit requests still answer</text>
+    <text x="820" y="293" font-size="20">immediately.</text>
+
+    <rect x="798" y="336" width="362" height="271" rx="14" fill="#ffffff" stroke="#a8beb8"/>
+    <text x="820" y="375" font-size="23" font-weight="700">Two separate stores</text>
+    <text x="820" y="418" font-size="20" font-weight="700" fill="#17675f">Review buffer</text>
+    <text x="820" y="448" font-size="20">Temporary and bounded.</text>
+    <text x="820" y="476" font-size="20">Discarded when Willow exits.</text>
+    <path d="M 820 497 H 1138" stroke="#d5dfdb"/>
+    <text x="820" y="531" font-size="20" font-weight="700" fill="#17675f">Fact history</text>
+    <text x="820" y="561" font-size="20">Saved locally with its own</text>
+    <text x="820" y="589" font-size="20">retention limits.</text>
+  </g>
+</svg>
