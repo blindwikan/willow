@@ -19,12 +19,16 @@ It does not transfer StateScribe's performance results to code or to Willow.
    NVDA, JAWS, VoiceOver and Orca on participants' devices?
 4. What prevents independent installation, recovery or continued use?
 
-Use a formative, mixed-method study with 3–5 blind screen-reader users who have
-coding or AI-tool experience. Include different experience levels if feasible.
+Aim for a mixed-method main study with approximately 10–12 blind screen-reader
+users who have coding or AI-tool experience, subject to recruitment feasibility.
+A smaller 3–5-person pilot can first identify installation and protocol problems.
+Include different experience levels and screen-reader/platform setups if feasible.
 Offer accessible recruitment and consent materials and participant-chosen
 communication formats. This sample supports rich case analysis and iteration;
 it cannot establish population-level effectiveness or decide paper format by
-itself. Expand or run additional iterations if coverage or claims require it.
+itself. The main-study target is not a statistical power justification; align
+claims and analysis with the eventual sample and evidence. Expand or run
+additional iterations if coverage or claims require it.
 
 Use matched toy projects and counterbalance condition order:
 
@@ -103,7 +107,7 @@ coder independently review a planned subset of transcripts and all ambiguous
 faithfulness/provenance cases where resources allow; reconcile and document
 disagreements. Choose and explain the analysis method before claiming coding
 reliability; do not manufacture a reliability number from consensus coding.
-Use descriptive and qualitative findings for 3–5 cases, not a claim of a
+Use descriptive and qualitative findings, not an unsupported claim of a
 powered population comparison. Keep the developer's longitudinal diary distinct
 from independent participant findings and acknowledge researcher involvement.
 
@@ -141,8 +145,12 @@ recording is not automatically consented research data.
 
 Mark and the institutional team need to confirm PI sponsorship and ethics
 eligibility, the approved recruitment/payment route and budget, study materials,
-and whether a second coder is available. The proposed £250 would allow £50 for
-each of five participants; review the rate and treatment of setup/withdrawal
+and whether a second coder is available. No payment budget is committed. A small
+amount of funding may be available depending on the final study design; revisit
+the original £250 estimate against the larger recruitment target and confirmed
+resources. Some builders may value trying and shaping a tool for their own work,
+but do not assume this motivates everyone or guarantees recruitment. State any
+payment arrangement clearly before consent, and review setup/withdrawal handling
 with the institution. These are open decisions, not commitments by Willow.
 
 ## Working milestones from the correspondence
